@@ -26,6 +26,9 @@ from warning_module import (
     evaluate_warnings, plot_river_warning_schematic,
     plot_dashboard_ring_chart, build_stats_cards_data,
     run_emergency_simulation,
+    EmergencyPlan, PlanSimulationResult, RecommendationResult,
+    run_batch_emergency_simulations, recommend_optimal_plan,
+    plot_river_warning_schematic_multi_plan, PLAN_LINE_COLORS,
 )
 
 rcParams['font.sans-serif'] = [
@@ -298,6 +301,18 @@ def init_session_state():
 
     if 'steady_sim_params' not in st.session_state:
         st.session_state.steady_sim_params = {}
+
+    if 'batch_plan_configs' not in st.session_state:
+        st.session_state.batch_plan_configs = []
+
+    if 'batch_plan_results' not in st.session_state:
+        st.session_state.batch_plan_results = None
+
+    if 'batch_plan_batch_id' not in st.session_state:
+        st.session_state.batch_plan_batch_id = None
+
+    if 'batch_recommend_mode' not in st.session_state:
+        st.session_state.batch_recommend_mode = 'cost_min'
 
 
 def plot_water_quality_profile(result, components=None):
@@ -1823,18 +1838,393 @@ def warning_emergency_tab():
     st.pyplot(fig_ring, use_container_width=True)
 
     st.markdown("---")
-    st.markdown("### 5️⃣ 预警历史记录")
-    st.caption(f"最多保留最近 {st.session_state.warning_history.max_records} 条记录")
+    st.markdown("### 5️⃣ 多方案对比 & 智能推荐")
+
+    st.markdown("#### 📋 方案配置（最多5套）")
+    col_n_plans, col_plan_hint = st.columns([1, 4])
+    with col_n_plans:
+        n_plans = st.number_input("配置方案数量", min_value=1, max_value=5, value=2, step=1, key="n_batch_plans")
+    with col_plan_hint:
+        st.info("💡 每套方案可独立配置一套应急措施（增氧/关排污口/削减排放），支持命名区分。对比将按红色预警数从少到多排序。")
+
+    default_plan_names = ["方案A", "方案B", "方案C", "方案D", "方案E"]
+    if len(st.session_state.batch_plan_configs) != n_plans:
+        new_configs = []
+        for i in range(n_plans):
+            if i < len(st.session_state.batch_plan_configs):
+                new_configs.append(st.session_state.batch_plan_configs[i])
+            else:
+                new_configs.append({'plan_name': default_plan_names[i], 'measures': []})
+        st.session_state.batch_plan_configs = new_configs
+
+    batch_plan_tabs = st.tabs([f"🗂️ {cfg['plan_name']}" for cfg in st.session_state.batch_plan_configs])
+    point_sources = sim.source_manager.get_point_sources()
+    src_names = [ps.name for ps in point_sources] if point_sources else []
+
+    for plan_idx in range(n_plans):
+        with batch_plan_tabs[plan_idx]:
+            cfg = st.session_state.batch_plan_configs[plan_idx]
+
+            col_pname, col_pdesc = st.columns([1, 3])
+            with col_pname:
+                plan_name = st.text_input(
+                    "方案名称",
+                    value=cfg.get('plan_name', default_plan_names[plan_idx]),
+                    key=f"batch_plan_name_{plan_idx}"
+                )
+            with col_pdesc:
+                current_measures = cfg.get('measures', [])
+                st.caption(f"已配置 {len(current_measures)} 项措施")
+                if current_measures:
+                    for mi, mm in enumerate(current_measures):
+                        st.caption(f"  {mi+1}. {mm.description}")
+
+            st.markdown("**添加应急措施:**")
+            bcol1, bcol2, bcol3 = st.columns(3)
+            with bcol1:
+                b_measure_type = st.selectbox(
+                    "措施类型",
+                    ['aerator', 'close_source', 'reduce_source'],
+                    format_func=lambda x: {
+                        'aerator': '💨 投放增氧剂',
+                        'close_source': '🚫 关闭排污口',
+                        'reduce_source': '📉 削减排污口',
+                    }[x],
+                    key=f"batch_measure_type_{plan_idx}"
+                )
+            with bcol2:
+                if b_measure_type == 'aerator':
+                    b_aerator_x = st.slider(
+                        "投放位置 (m)", x_min, x_max,
+                        x_min + (x_max - x_min) * (0.3 + plan_idx * 0.1),
+                        key=f"batch_aerator_x_{plan_idx}"
+                    )
+                    b_aerator_do = st.slider(
+                        "增氧浓度 (mg/L)", 2.0, 15.0, 9.0, 0.5,
+                        key=f"batch_aerator_do_{plan_idx}"
+                    )
+                    b_aerator_flow = st.slider(
+                        "注入流量 (m³/s)", 0.05, 2.0, 0.3, 0.05,
+                        key=f"batch_aerator_flow_{plan_idx}"
+                    )
+                elif not src_names:
+                    st.warning("无可用排污口")
+                    b_source_name = None
+                else:
+                    b_source_name = st.selectbox(
+                        "选择排污口",
+                        src_names,
+                        key=f"batch_src_name_{plan_idx}"
+                    )
+            with bcol3:
+                if b_measure_type == 'aerator':
+                    b_desc = f"💨 增氧@{b_aerator_x:.0f}m (DO={b_aerator_do:.1f}, Q={b_aerator_flow:.2f}m³/s)"
+                    st.caption(f"预估: {b_desc}")
+                elif b_measure_type == 'close_source' and b_source_name:
+                    b_desc = f"🚫 关闭排污口[{b_source_name}]"
+                    st.caption(f"预估: {b_desc}")
+                elif b_measure_type == 'reduce_source' and b_source_name:
+                    b_reduce_ratio = st.slider(
+                        "削减比例 (%)", 10, 90, 50, 5,
+                        key=f"batch_reduce_ratio_{plan_idx}"
+                    ) / 100.0
+                    b_desc = f"📉 削减[{b_source_name}]排放{b_reduce_ratio*100:.0f}%"
+                    st.caption(f"预估: {b_desc}")
+                else:
+                    b_desc = ""
+
+            bc_add, bc_clear = st.columns([1, 1])
+            with bc_add:
+                b_add = st.button("➕ 添加措施", key=f"batch_add_measure_{plan_idx}", use_container_width=True)
+            with bc_clear:
+                b_clear = st.button("🗑️ 清空措施", key=f"batch_clear_measures_{plan_idx}", use_container_width=True)
+
+            if b_add:
+                new_measure = None
+                if b_measure_type == 'aerator':
+                    new_measure = EmergencyMeasure(
+                        measure_type='aerator',
+                        position=b_aerator_x,
+                        description=b_desc,
+                        params={'do_supply': b_aerator_do, 'flow_inject': b_aerator_flow}
+                    )
+                elif b_measure_type == 'close_source' and b_source_name:
+                    new_measure = EmergencyMeasure(
+                        measure_type='close_source',
+                        position=0.0,
+                        description=b_desc,
+                        params={'source_name': b_source_name, 'reduce_ratio': 1.0}
+                    )
+                elif b_measure_type == 'reduce_source' and b_source_name:
+                    new_measure = EmergencyMeasure(
+                        measure_type='reduce_source',
+                        position=0.0,
+                        description=b_desc,
+                        params={'source_name': b_source_name, 'reduce_ratio': b_reduce_ratio}
+                    )
+                if new_measure:
+                    cfg['measures'].append(new_measure)
+                    cfg['plan_name'] = plan_name
+                    st.success(f"✅ 已添加: {b_desc}")
+                    st.rerun()
+
+            if b_clear:
+                cfg['measures'] = []
+                cfg['plan_name'] = plan_name
+                st.info("✅ 该方案措施已清空")
+                st.rerun()
+
+            cfg['plan_name'] = plan_name
+
+    all_plans_valid = True
+    for cfg in st.session_state.batch_plan_configs:
+        if not cfg.get('measures'):
+            all_plans_valid = False
+            break
+
+    st.markdown("")
+    run_batch_col, reset_batch_col = st.columns([1, 1])
+    with run_batch_col:
+        run_batch = st.button(
+            "🔬 批量对比模拟",
+            type="primary",
+            disabled=not all_plans_valid or not st.session_state.steady_sim_params,
+            use_container_width=True,
+        )
+    with reset_batch_col:
+        reset_batch = st.button("🔄 清空所有方案配置", use_container_width=True)
+
+    if not all_plans_valid:
+        st.warning("⚠️ 请确保每套方案至少配置1项措施")
+    if not st.session_state.steady_sim_params:
+        st.warning("⚠️ 请先在【稳态模拟】标签页运行一次稳态模拟")
+
+    if reset_batch:
+        st.session_state.batch_plan_configs = []
+        st.session_state.batch_plan_results = None
+        st.session_state.batch_plan_batch_id = None
+        st.success("✅ 方案配置已全部清空")
+        st.rerun()
+
+    if run_batch and all_plans_valid and st.session_state.steady_sim_params:
+        emergency_plans = []
+        for cfg in st.session_state.batch_plan_configs:
+            pname = cfg.get('plan_name', '未命名')
+            measures = cfg.get('measures', [])
+            emergency_plans.append(EmergencyPlan(plan_name=pname, measures=measures))
+
+        with st.spinner(f"正在并行运行 {len(emergency_plans)} 套方案的应急模拟..."):
+            batch_id, plan_results = run_batch_emergency_simulations(
+                plans=emergency_plans,
+                sim=sim,
+                base_kwargs=st.session_state.steady_sim_params,
+                rules=rules,
+                base_result=result,
+                base_warning_data=warning_data,
+            )
+            st.session_state.batch_plan_results = plan_results
+            st.session_state.batch_plan_batch_id = batch_id
+
+            for plan_res in plan_results:
+                measures_text = "; ".join([m.description for m in plan_res.measures])
+                st.session_state.warning_history.add_batch_record(
+                    record_type='batch_emergency',
+                    stats=plan_res.warning_data['stats'],
+                    measures_desc=measures_text,
+                    batch_id=batch_id,
+                    plan_name=plan_res.plan_name,
+                    total_cost=plan_res.total_cost,
+                    normal_pct=plan_res.normal_pct,
+                    key_point_do_delta=plan_res.key_point_do_delta,
+                )
+
+        st.success(f"✅ 批量模拟完成！批次ID: {batch_id[:19]}，共 {len(plan_results)} 套方案")
+
+    if st.session_state.batch_plan_results is not None:
+        plan_results = st.session_state.batch_plan_results
+        base_normal_count = warning_data['stats']['normal_count']
+
+        st.markdown("")
+        st.markdown("#### 📊 方案汇总对比表")
+        st.caption("按【红色预警数从少到多】排序")
+
+        compare_table_data = []
+        for idx, pr in enumerate(plan_results):
+            key_point_x = pr.key_point_x
+            do_delta_sign = "+" if pr.key_point_do_delta >= 0 else ""
+            compare_table_data.append({
+                '排名': idx + 1,
+                '方案名称': pr.plan_name,
+                '🔴 红色预警': pr.red_count,
+                '🟠 橙色预警': pr.orange_count,
+                '🟢 正常断面占比(%)': f"{pr.normal_pct:.1f}",
+                f'排污口下游500m处DO变化\n(x={key_point_x:.0f}m, mg/L)': f"{do_delta_sign}{pr.key_point_do_delta:.2f}",
+                '💰 总成本估算(万元)': f"{pr.total_cost:.2f}",
+            })
+        df_compare = pd.DataFrame(compare_table_data)
+
+        def highlight_compare_rows(row):
+            styles = pd.Series('', index=row.index)
+            red_val = row['🔴 红色预警']
+            if red_val == 0:
+                styles[:] = 'background-color: #e8f8f5; font-weight: 500'
+            elif red_val <= 3:
+                styles[:] = 'background-color: #fef9e7'
+            else:
+                styles[:] = 'background-color: #fdedec'
+            return styles
+
+        styled_compare = df_compare.style.apply(highlight_compare_rows, axis=1)
+        styled_compare = styled_compare.map(
+            lambda v: 'color: #c0392b; font-weight: bold' if isinstance(v, (int, float)) and v > 0 and '红色' in str(v) else '',
+            subset=['🔴 红色预警']
+        )
+        st.dataframe(styled_compare, use_container_width=True, hide_index=True, height=200)
+
+        with st.expander("💸 查看各方案成本明细"):
+            for idx, pr in enumerate(plan_results):
+                plan_color = PLAN_LINE_COLORS[idx % len(PLAN_LINE_COLORS)]
+                st.markdown(f"<h5 style='color:{plan_color}; margin:8px 0;'>"
+                            f"方案{idx+1} · {pr.plan_name} · 总成本 {pr.total_cost:.2f} 万元</h5>",
+                            unsafe_allow_html=True)
+                if pr.cost_details.get('details'):
+                    for detail in pr.cost_details['details']:
+                        st.caption(f"  • {detail}")
+                else:
+                    st.caption("  • 无成本计算措施")
+                st.markdown("---")
+
+        st.markdown("")
+        st.markdown("#### 🗺️ 河段示意图（多方案叠加）")
+        st.caption("基准状态用实心色带，各方案用不同样式的虚线框叠加展示预警状态")
+        fig_multi = plot_river_warning_schematic_multi_plan(
+            result=result,
+            warning_data=warning_data,
+            sim=sim,
+            plan_results=plan_results,
+            hover_idx=hover_idx,
+            figsize=(14, 7),
+        )
+        st.pyplot(fig_multi, use_container_width=True)
+
+        st.markdown("")
+        st.markdown("#### 🤖 智能推荐最优方案")
+
+        rec_col1, rec_col2 = st.columns([1.2, 3])
+        with rec_col1:
+            rec_mode = st.radio(
+                "选择优化目标模式",
+                ['cost_min', 'effect_max', 'cost_effective'],
+                format_func=lambda x: {
+                    'cost_min': '① 成本最低（红警清零前提下）',
+                    'effect_max': '② 效果最优（正常占比最高）',
+                    'cost_effective': '③ 性价比最优（正常增加/成本）',
+                }[x],
+                index=['cost_min', 'effect_max', 'cost_effective'].index(st.session_state.batch_recommend_mode),
+                key="batch_recommend_mode_radio",
+            )
+            st.session_state.batch_recommend_mode = rec_mode
+
+        recommendation = recommend_optimal_plan(plan_results, rec_mode, base_normal_count)
+
+        with rec_col2:
+            if not recommendation.can_clear_red and rec_mode == 'cost_min':
+                st.markdown(
+                    f"<div style='padding:20px; border-radius:14px; "
+                    f"border:3px solid #e67e22; background-color:#fef5e7;'>"
+                    f"<h3 style='margin:0 0 10px 0; color:#d35400;'>⚠️ 无法推荐</h3>"
+                    f"<p style='margin:0; font-size:16px; color:#873600; line-height:1.6;'>"
+                    f"<b>{recommendation.reason}</b><br>"
+                    f"建议：① 增加增氧站点或提高增氧剂量；② 关闭更多排污口；"
+                    f"③ 加大削减排放比例至80%以上。</p>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            elif recommendation.recommended_plan_idx is not None:
+                best_idx = recommendation.recommended_plan_idx
+                best_result = plan_results[best_idx]
+                best_color = PLAN_LINE_COLORS[best_idx % len(PLAN_LINE_COLORS)]
+
+                mode_label = {
+                    'cost_min': '成本最低模式',
+                    'effect_max': '效果最优模式',
+                    'cost_effective': '性价比最优模式',
+                }[rec_mode]
+
+                cost_detail_str = ""
+                if best_result.cost_details.get('details'):
+                    cost_detail_str = "<br>".join([f"&nbsp;&nbsp;• {d}" for d in best_result.cost_details['details']])
+                else:
+                    cost_detail_str = "&nbsp;&nbsp;无直接成本项"
+
+                key_point_x = best_result.key_point_x
+                do_sign = "+" if best_result.key_point_do_delta >= 0 else ""
+                st.markdown(
+                    f"<div style='padding:22px; border-radius:16px; "
+                    f"border:3px solid {best_color}; background-color:linear-gradient(135deg, #eafaf1 0%, #d5f5e3 100%); "
+                    f"box-shadow: 0 4px 14px rgba(39,174,96,0.15);'>"
+                    f"<h3 style='margin:0 0 12px 0; color:#1e8449;'>"
+                    f"🌟 推荐方案：{best_result.plan_name}（方案{best_idx+1}）</h3>"
+                    f"<p style='margin:0 0 10px 0; font-size:13px; color:#27ae60; font-weight:600;'>"
+                    f"优化目标：{mode_label}</p>"
+                    f"<p style='margin:0 0 12px 0; font-size:15px; color:#145a32; line-height:1.6;'>"
+                    f"✅ <b>{recommendation.reason}</b></p>"
+                    f"<div style='display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:10px;'>"
+                    f"<div style='padding:10px; background:white; border-radius:8px; text-align:center;'>"
+                    f"<div style='font-size:12px; color:#666;'>红色预警</div>"
+                    f"<div style='font-size:20px; font-weight:bold; "
+                    f"color:{'#27ae60' if best_result.red_count==0 else '#e74c3c'};'>{best_result.red_count}</div>"
+                    f"</div>"
+                    f"<div style='padding:10px; background:white; border-radius:8px; text-align:center;'>"
+                    f"<div style='font-size:12px; color:#666;'>正常断面占比</div>"
+                    f"<div style='font-size:20px; font-weight:bold; color:#2980b9;'>{best_result.normal_pct:.1f}%</div>"
+                    f"</div>"
+                    f"<div style='padding:10px; background:white; border-radius:8px; text-align:center;'>"
+                    f"<div style='font-size:12px; color:#666;'>DO变化@{key_point_x:.0f}m</div>"
+                    f"<div style='font-size:20px; font-weight:bold; "
+                    f"color:{'#27ae60' if best_result.key_point_do_delta>=0 else '#e74c3c'};'>"
+                    f"{do_sign}{best_result.key_point_do_delta:.2f}</div>"
+                    f"</div>"
+                    f"<div style='padding:10px; background:white; border-radius:8px; text-align:center;'>"
+                    f"<div style='font-size:12px; color:#666;'>总成本</div>"
+                    f"<div style='font-size:20px; font-weight:bold; color:#8e44ad;'>{best_result.total_cost:.2f}万</div>"
+                    f"</div>"
+                    f"</div>"
+                    f"<details style='margin:0;'><summary style='cursor:pointer; color:#145a32; font-size:13px;'>"
+                    f"📋 查看该方案措施清单 & 成本明细</summary>"
+                    f"<div style='margin-top:8px; padding:12px; background:white; border-radius:8px;'>"
+                    f"<b>措施清单({len(best_result.measures)}项)：</b><br>"
+                    + "<br>".join([f"&nbsp;&nbsp;• {m.description}" for m in best_result.measures]) +
+                    f"<br><br><b>成本明细：</b><br>{cost_detail_str}"
+                    f"</div></details>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"<div style='padding:20px; border-radius:14px; "
+                    f"border:2px solid #95a5a6; background-color:#f8f9f9;'>"
+                    f"<h4 style='margin:0; color:#7f8c8d;'>{recommendation.reason}</h4>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+    st.markdown("### 6️⃣ 预警历史记录")
+    st.caption(f"最多保留最近 {st.session_state.warning_history.max_records} 条记录（批量对比的每套方案作为独立记录，同批次共享批次ID）")
 
     if not st.session_state.warning_history.is_empty():
         df_history = st.session_state.warning_history.to_dataframe()
 
         def highlight_rows(row):
             styles = pd.Series('', index=row.index)
-            if row['记录类型'] == '应急模拟':
+            rtype = row.get('记录类型', '')
+            if rtype == '应急模拟':
                 styles = 'background-color: #eaf2f8;'
-            elif row['记录类型'] == '规则应用':
+            elif rtype == '规则应用':
                 styles = 'background-color: #fef9e7;'
+            elif '批量' in rtype:
+                styles = 'background-color: #eafaf1;'
             return styles
 
         styled_history = df_history.style.apply(highlight_rows, axis=1)
@@ -1855,7 +2245,7 @@ def warning_emergency_tab():
                 st.session_state.warning_history = WarningHistory(max_records=20)
                 st.rerun()
     else:
-        st.info("📭 暂无历史记录，点击【应用规则】或【运行应急模拟】后记录将自动保存")
+        st.info("📭 暂无历史记录，点击【应用规则】或【运行应急模拟】/【批量对比模拟】后记录将自动保存")
 
 
 def main():
