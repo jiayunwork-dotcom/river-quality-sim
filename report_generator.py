@@ -74,12 +74,21 @@ class ReportGenerator:
         story.append(param_table)
 
         story.append(Paragraph("二、水质参数", heading_style))
+
+        def _fmt(val, decimals=4):
+            try:
+                return f"{float(val):.{decimals}f}"
+            except (ValueError, TypeError):
+                return str(val)
+
         wq_data = [
             ['参数', '数值', '单位'],
-            ['BOD衰减系数(K1)', str(params.get('K1', 0.25)), '1/d'],
-            ['复氧系数(K2)', str(params.get('K2', 0.5)), '1/d'],
-            ['扩散系数(Dx)', str(params.get('Dx', 10.0)), 'm²/s'],
-            ['饱和溶解氧', str(params.get('D_O_sat', 9.5)), 'mg/L'],
+            ['BOD衰减系数(K1)', _fmt(params.get('K1', 0.25)), '1/d'],
+            ['复氧系数(K2)', _fmt(params.get('K2', 0.5)), '1/d'],
+            ['氨氮衰减系数(K_nh3n)', _fmt(params.get('K_nh3n', 0.1)), '1/d'],
+            ['COD衰减系数(K_cod)', _fmt(params.get('K_cod', 0.15)), '1/d'],
+            ['扩散系数(Dx)', _fmt(params.get('Dx', 10.0), 2), 'm²/s'],
+            ['饱和溶解氧(DO_sat)', _fmt(params.get('D_O_sat', 9.5), 2), 'mg/L'],
         ]
         wq_table = Table(wq_data, colWidths=[5*cm, 5*cm, 3*cm])
         wq_table.setStyle(TableStyle([

@@ -57,6 +57,9 @@ def init_session_state():
     if 'calibration_data' not in st.session_state:
         st.session_state.calibration_data = CalibrationData(x=[])
 
+    if 'auto_run' not in st.session_state:
+        st.session_state.auto_run = True
+
 
 def plot_water_quality_profile(result, components=None):
     """绘制沿程水质剖面图"""
@@ -86,7 +89,10 @@ def plot_water_quality_profile(result, components=None):
         ax = axes[idx]
         data = result[comp]
 
-        ax.plot(x, data, color=color_map[comp], linewidth=2, label=name_map[comp])
+        scheme = result.get('wq_scheme', 'upwind')
+        label_suffix = f" ({scheme.upper()}方案)" if idx == 0 else ""
+
+        ax.plot(x, data, color=color_map[comp], linewidth=2, label=name_map[comp] + label_suffix)
 
         if comp in WATER_QUALITY_STANDARDS:
             ax.axhline(y=WATER_QUALITY_STANDARDS[comp], color='green',
@@ -99,7 +105,7 @@ def plot_water_quality_profile(result, components=None):
         ax.set_xlabel('河流距离 (m)')
         ax.set_ylabel(name_map[comp])
         ax.set_title(f'沿程{name_map[comp].split(" ")[0]}浓度分布')
-        ax.legend(loc='best')
+        ax.legend(loc='best', fontsize=8)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -273,19 +279,24 @@ def sidebar_wq_params():
     """侧边栏：水质参数"""
     st.sidebar.header("🧪 水质参数")
 
-    K1 = st.sidebar.slider("BOD衰减系数 K1 (1/d)", 0.01, 2.0, 0.25, 0.01)
-    K2 = st.sidebar.slider("复氧系数 K2 (1/d)", 0.01, 5.0, 0.5, 0.01)
-    Dx = st.sidebar.slider("扩散系数 Dx (m²/s)", 0.0, 100.0, 10.0, 0.5)
-    D_sat = st.sidebar.slider("饱和溶解氧 (mg/L)", 5.0, 15.0, 9.5, 0.1)
+    K1 = st.sidebar.slider("BOD衰减系数 K1 (1/d)", 0.01, 2.0, 0.25, 0.01, key="K1_slider")
+    K2 = st.sidebar.slider("复氧系数 K2 (1/d)", 0.01, 5.0, 0.5, 0.01, key="K2_slider")
+    Dx = st.sidebar.slider("扩散系数 Dx (m²/s)", 0.0, 100.0, 10.0, 0.5, key="Dx_slider")
+    D_sat = st.sidebar.slider("饱和溶解氧 (mg/L)", 5.0, 15.0, 9.5, 0.1, key="Dsat_slider")
 
-    K_nh3n = st.sidebar.slider("氨氮衰减系数 (1/d)", 0.01, 1.0, 0.1, 0.01)
-    K_cod = st.sidebar.slider("COD衰减系数 (1/d)", 0.01, 1.0, 0.15, 0.01)
+    K_nh3n = st.sidebar.slider("氨氮衰减系数 (1/d)", 0.01, 1.0, 0.1, 0.01, key="Knh3n_slider")
+    K_cod = st.sidebar.slider("COD衰减系数 (1/d)", 0.01, 1.0, 0.15, 0.01, key="Kcod_slider")
 
     sim = st.session_state.simulation
     sim.set_water_quality_params(
         K1=K1, K2=K2, Dx=Dx, D_O_sat=D_sat,
         K_nh3n=K_nh3n, K_cod=K_cod
     )
+
+    st.session_state.current_wq_params = {
+        'K1': K1, 'K2': K2, 'Dx': Dx, 'D_O_sat': D_sat,
+        'K_nh3n': K_nh3n, 'K_cod': K_cod
+    }
 
 
 def sidebar_sources():
@@ -298,11 +309,12 @@ def sidebar_sources():
     source_type = st.sidebar.selectbox(
         "污染源类型",
         ['point', 'nonpoint', 'accidental'],
-        format_func=lambda x: {'point': '点源', 'nonpoint': '面源', 'accidental': '突发泄漏'}[x]
+        format_func=lambda x: {'point': '点源', 'nonpoint': '面源', 'accidental': '突发泄漏'}[x],
+        key="source_type_select"
     )
 
     if source_type == 'point':
-        n_sources = st.sidebar.number_input("点源数量", min_value=0, max_value=10, value=1)
+        n_sources = st.sidebar.number_input("点源数量", min_value=0, max_value=10, value=1, key="n_points")
 
         for i in range(n_sources):
             with st.sidebar.expander(f"点源 {i+1}", expanded=(i == 0)):
@@ -317,20 +329,26 @@ def sidebar_sources():
                 sim.add_point_source(name, x, q, bod, do, nh3n, cod)
 
     elif source_type == 'nonpoint':
-        n_sources = st.sidebar.number_input("面源数量", min_value=0, max_value=5, value=0)
+        n_sources = st.sidebar.number_input("面源数量", min_value=0, max_value=5, value=1, key="n_nonpoints")
 
         for i in range(n_sources):
-            with st.sidebar.expander(f"面源 {i+1}"):
+            with st.sidebar.expander(f"面源 {i+1}", expanded=(i == 0)):
                 name = st.text_input(f"名称 - 面源{i+1}", f"农业面源{i+1}", key=f"nps_name_{i}")
                 start_x = st.number_input(f"起始位置 (m) - 面源{i+1}", 0.0, 20000.0, 2000.0, key=f"nps_start_{i}")
                 end_x = st.number_input(f"终止位置 (m) - 面源{i+1}", 0.0, 20000.0, 6000.0, key=f"nps_end_{i}")
                 area = st.slider(f"汇水面积 (km²) - 面源{i+1}", 0.1, 50.0, 5.0, key=f"nps_area_{i}")
-                bod_load = st.slider(f"BOD负荷 (g/m²·d) - 面源{i+1}", 0.0, 100.0, 10.0, key=f"nps_bod_{i}")
+                bod_load = st.slider(f"BOD负荷 (kg/km²·d) - 面源{i+1}", 0.0, 100.0, 10.0, key=f"nps_bod_{i}")
+                nh3n_load = st.slider(f"NH3-N负荷 (kg/km²·d) - 面源{i+1}", 0.0, 50.0, 2.0, key=f"nps_nh3n_{i}")
+                cod_load = st.slider(f"COD负荷 (kg/km²·d) - 面源{i+1}", 0.0, 100.0, 15.0, key=f"nps_cod_{i}")
 
-                sim.add_nonpoint_source(name, start_x, end_x, area * 1e6, bod_load / 1e6)
+                sim.add_nonpoint_source(name, start_x, end_x,
+                                        area * 1e6,
+                                        bod_load,
+                                        nh3n_load,
+                                        cod_load)
 
     else:
-        n_sources = st.sidebar.number_input("泄漏源数量", min_value=0, max_value=3, value=0)
+        n_sources = st.sidebar.number_input("泄漏源数量", min_value=0, max_value=3, value=0, key="n_accidental")
 
         for i in range(n_sources):
             with st.sidebar.expander(f"泄漏源 {i+1}"):
@@ -338,83 +356,24 @@ def sidebar_sources():
                 x = st.number_input(f"位置 (m) - 泄漏{i+1}", 0.0, 20000.0, 5000.0, key=f"acc_x_{i}")
                 release_type = st.selectbox(
                     f"排放类型 - 泄漏{i+1}",
-                    ['instantaneous', 'continuous'],
+                    ['continuous', 'instantaneous'],
                     key=f"acc_type_{i}",
-                    format_func=lambda x: '瞬时排放' if x == 'instantaneous' else '持续排放'
+                    format_func=lambda x: '持续排放' if x == 'continuous' else '瞬时排放'
                 )
                 mass_bod = st.slider(f"BOD总量 (kg) - 泄漏{i+1}", 10.0, 10000.0, 1000.0, key=f"acc_mass_{i}")
+                mass_nh3n = st.slider(f"NH3-N总量 (kg) - 泄漏{i+1}", 10.0, 5000.0, 200.0, key=f"acc_mass_nh3n_{i}")
+                mass_cod = st.slider(f"COD总量 (kg) - 泄漏{i+1}", 10.0, 10000.0, 1500.0, key=f"acc_mass_cod_{i}")
                 duration = st.slider(f"排放时长 (小时) - 泄漏{i+1}", 0.1, 24.0, 2.0, key=f"acc_dur_{i}") if release_type == 'continuous' else 0
+                flow_rate = st.slider(f"排放流量 (m³/s) - 泄漏{i+1}", 0.0, 2.0, 0.5, key=f"acc_flow_{i}") if release_type == 'continuous' else 0
 
                 sim.add_accidental_source(
                     name, x, release_type,
                     total_mass_bod=mass_bod * 1000,
-                    release_duration=duration * 3600 if release_type == 'continuous' else 0
+                    total_mass_nh3n=mass_nh3n * 1000,
+                    total_mass_cod=mass_cod * 1000,
+                    release_duration=duration * 3600 if release_type == 'continuous' else 1,
+                    flow_rate=flow_rate
                 )
-
-
-def sidebar_simulation_params():
-    """侧边栏：模拟参数"""
-    st.sidebar.header("⚙️ 模拟参数")
-
-    flow_mode = st.sidebar.selectbox(
-        "水流模式",
-        ['uniform', 'gradually_varied'],
-        format_func=lambda x: {
-            'uniform': '恒定均匀流',
-            'gradually_varied': '恒定非均匀流'
-        }[x]
-    )
-
-    Q_upstream = st.sidebar.slider("上游流量 (m³/s)", 0.1, 50.0, 10.0, 0.5)
-
-    initial_bod = st.sidebar.slider("上游BOD (mg/L)", 0.0, 20.0, 2.0, 0.5)
-    initial_do = st.sidebar.slider("上游DO (mg/L)", 0.0, 15.0, 8.5, 0.1)
-    initial_nh3n = st.sidebar.slider("上游NH3-N (mg/L)", 0.0, 10.0, 0.5, 0.1)
-    initial_cod = st.sidebar.slider("上游COD (mg/L)", 0.0, 50.0, 5.0, 0.5)
-
-    n_grid = st.sidebar.slider("空间网格数", 20, 500, 100, 10)
-
-    return {
-        'flow_mode': flow_mode,
-        'Q_upstream': Q_upstream,
-        'initial_bod': initial_bod,
-        'initial_do': initial_do,
-        'initial_nh3n': initial_nh3n,
-        'initial_cod': initial_cod,
-        'n_grid': n_grid,
-    }
-
-
-def sidebar_unsteady_params():
-    """侧边栏：非稳态模拟参数"""
-    st.sidebar.header("⏱️ 非稳态参数")
-
-    t_total_hours = st.sidebar.slider("总模拟时长 (小时)", 1, 120, 24)
-    dt_minutes = st.sidebar.slider("时间步长 (分钟)", 1, 60, 10)
-
-    Q_base = st.sidebar.slider("基流流量 (m³/s)", 0.1, 50.0, 10.0, 0.5)
-    has_flood = st.sidebar.checkbox("洪水过程", value=False)
-
-    t_total = t_total_hours * 3600
-    dt = dt_minutes * 60
-
-    n_steps = int(t_total / dt)
-    t = np.arange(n_steps + 1) * dt
-
-    if has_flood:
-        flood_peak = st.sidebar.slider("洪峰流量 (m³/s)", Q_base, 100.0, 30.0, 0.5)
-        flood_time = st.sidebar.slider("洪峰出现时间 (小时)", 0, t_total_hours, t_total_hours // 2)
-
-        Q_upstream = Q_base + (flood_peak - Q_base) * np.exp(-((t / 3600 - flood_time) ** 2) / 16)
-    else:
-        Q_upstream = np.full(n_steps + 1, Q_base)
-
-    return {
-        't_total': t_total,
-        'dt': dt,
-        'Q_upstream': Q_upstream,
-        'n_steps': n_steps,
-    }
 
 
 def main_page():
@@ -450,29 +409,74 @@ def steady_simulation_tab():
     """稳态模拟标签页"""
     st.header("稳态水质模拟")
 
-    sim_params = sidebar_simulation_params()
-
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
+        flow_mode = st.selectbox(
+            "水流模式",
+            ['uniform', 'gradually_varied'],
+            format_func=lambda x: {
+                'uniform': '恒定均匀流',
+                'gradually_varied': '恒定非均匀流'
+            }[x]
+        )
+
+    with col2:
+        wq_scheme = st.selectbox(
+            "数值求解方案",
+            ['upwind', 'crank_nicolson'],
+            format_func=lambda x: {
+                'upwind': '上风格式 (显式)',
+                'crank_nicolson': 'Crank-Nicolson隐格式'
+            }[x]
+        )
+
+    with col3:
+        auto_run = st.checkbox("参数变化自动运行（推荐）", value=st.session_state.auto_run, key="auto_run_checkbox")
+        st.session_state.auto_run = auto_run
+        if auto_run:
+            st.caption("✅ 调节滑块后图表将自动刷新")
+
+    st.subheader("上游边界条件")
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        Q_upstream = st.slider("上游流量 (m³/s)", 0.1, 50.0, 10.0, 0.5, key="steady_Q")
+    with col2:
+        initial_bod = st.slider("上游BOD (mg/L)", 0.0, 20.0, 2.0, 0.5, key="steady_bod")
+    with col3:
+        initial_do = st.slider("上游DO (mg/L)", 0.0, 15.0, 8.5, 0.1, key="steady_do")
+    with col4:
+        initial_nh3n = st.slider("上游NH3-N (mg/L)", 0.0, 10.0, 0.5, 0.1, key="steady_nh3n")
+    with col5:
+        initial_cod = st.slider("上游COD (mg/L)", 0.0, 50.0, 5.0, 0.5, key="steady_cod")
+
+    n_grid = st.slider("空间网格数", 20, 500, 100, 10, key="steady_grid")
+
+    col_run, col_empty = st.columns([1, 3])
+    with col_run:
         run_steady = st.button("🚀 运行稳态模拟", type="primary", use_container_width=True)
 
-    if run_steady:
+    sim = st.session_state.simulation
+    should_run = run_steady or st.session_state.auto_run
+    if should_run:
         with st.spinner("正在计算..."):
-            sim = st.session_state.simulation
             result = sim.run_steady_simulation(
-                Q_upstream=sim_params['Q_upstream'],
-                initial_bod=sim_params['initial_bod'],
-                initial_do=sim_params['initial_do'],
-                initial_nh3n=sim_params['initial_nh3n'],
-                initial_cod=sim_params['initial_cod'],
-                flow_mode=sim_params['flow_mode'],
-                n_grid=sim_params['n_grid'],
+                Q_upstream=Q_upstream,
+                initial_bod=initial_bod,
+                initial_do=initial_do,
+                initial_nh3n=initial_nh3n,
+                initial_cod=initial_cod,
+                flow_mode=flow_mode,
+                n_grid=n_grid,
+                wq_scheme=wq_scheme,
             )
             st.session_state.result = result
 
     if st.session_state.result is not None:
         result = st.session_state.result
+
+        st.success(f"✅ 模拟完成！使用 {result.get('wq_scheme', wq_scheme).upper()} 数值方案")
 
         st.subheader("📈 沿程水质分布")
         fig_profile = plot_water_quality_profile(result)
@@ -510,34 +514,71 @@ def steady_simulation_tab():
             with col4:
                 st.metric("最大COD", f"{np.max(result['cod']):.2f} mg/L")
 
+            st.caption(f"当前参数：K1={sim.wq_model.params.K1:.3f} 1/d, K2={sim.wq_model.params.K2:.3f} 1/d, Dx={sim.wq_model.params.Dx:.1f} m²/s")
+
 
 def unsteady_simulation_tab():
     """非稳态模拟标签页"""
     st.header("非稳态水质模拟")
 
-    unsteady_params = sidebar_unsteady_params()
     sim = st.session_state.simulation
 
-    initial_bod = st.sidebar.slider("上游初始BOD (mg/L)", 0.0, 20.0, 2.0, 0.5, key='unsteady_bod')
-    initial_do = st.sidebar.slider("上游初始DO (mg/L)", 0.0, 15.0, 8.5, 0.1, key='unsteady_do')
-    initial_nh3n = st.sidebar.slider("上游初始NH3-N (mg/L)", 0.0, 10.0, 0.5, 0.1, key='unsteady_nh3n')
-    initial_cod = st.sidebar.slider("上游初始COD (mg/L)", 0.0, 50.0, 5.0, 0.5, key='unsteady_cod')
-    n_grid = st.sidebar.slider("空间网格数", 20, 200, 50, 10, key='unsteady_grid')
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        t_total_hours = st.slider("总模拟时长 (小时)", 1, 120, 24, key="unsteady_t")
+    with col2:
+        dt_minutes = st.slider("时间步长 (分钟)", 1, 60, 10, key="unsteady_dt")
+    with col3:
+        wq_scheme = st.selectbox(
+            "数值方案",
+            ['upwind', 'crank_nicolson'],
+            format_func=lambda x: {'upwind': '上风格式', 'crank_nicolson': 'Crank-Nicolson隐格式'}[x],
+            key="unsteady_scheme"
+        )
 
-    wq_scheme = st.sidebar.selectbox(
-        "数值方案",
-        ['upwind', 'crank_nicolson'],
-        format_func=lambda x: {'upwind': '上风格式', 'crank_nicolson': 'Crank-Nicolson隐格式'}[x]
-    )
+    col1, col2 = st.columns(2)
+    with col1:
+        Q_base = st.slider("基流流量 (m³/s)", 0.1, 50.0, 10.0, 0.5, key="unsteady_Qbase")
+    with col2:
+        has_flood = st.checkbox("洪水过程", value=False, key="unsteady_flood")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        initial_bod = st.slider("上游初始BOD (mg/L)", 0.0, 20.0, 2.0, 0.5, key='unsteady_bod')
+    with col2:
+        initial_do = st.slider("上游初始DO (mg/L)", 0.0, 15.0, 8.5, 0.1, key='unsteady_do')
+    with col3:
+        initial_nh3n = st.slider("上游初始NH3-N (mg/L)", 0.0, 10.0, 0.5, 0.1, key='unsteady_nh3n')
+    with col4:
+        initial_cod = st.slider("上游初始COD (mg/L)", 0.0, 50.0, 5.0, 0.5, key='unsteady_cod')
+
+    n_grid = st.slider("空间网格数", 20, 200, 50, 10, key='unsteady_grid')
+
+    t_total = t_total_hours * 3600
+    dt = dt_minutes * 60
+
+    n_steps = int(t_total / dt)
+    t = np.arange(n_steps + 1) * dt
+
+    if has_flood:
+        col1, col2 = st.columns(2)
+        with col1:
+            flood_peak = st.slider("洪峰流量 (m³/s)", Q_base, 100.0, 30.0, 0.5, key="unsteady_peak")
+        with col2:
+            flood_time = st.slider("洪峰出现时间 (小时)", 0, t_total_hours, t_total_hours // 2, key="unsteady_peak_t")
+
+        Q_upstream = Q_base + (flood_peak - Q_base) * np.exp(-((t / 3600 - flood_time) ** 2) / 16)
+    else:
+        Q_upstream = np.full(n_steps + 1, Q_base)
 
     run_unsteady = st.button("⏱️ 运行非稳态模拟", type="primary")
 
     if run_unsteady:
         with st.spinner("正在计算非稳态过程..."):
             result = sim.run_unsteady_simulation(
-                Q_upstream=unsteady_params['Q_upstream'],
-                t_total=unsteady_params['t_total'],
-                dt=unsteady_params['dt'],
+                Q_upstream=Q_upstream,
+                t_total=t_total,
+                dt=dt,
                 initial_bod=initial_bod,
                 initial_do=initial_do,
                 initial_nh3n=initial_nh3n,
@@ -553,7 +594,7 @@ def unsteady_simulation_tab():
             dx = result['x'][1] - result['x'][0]
             V_max = np.max(result['V'])
             suggested_dt = sim.suggest_dt(V_max, dx)
-            st.info(f"💡 建议时间步长：{suggested_dt / 60:.1f} 分钟（当前：{unsteady_params['dt'] / 60:.1f} 分钟）")
+            st.info(f"💡 建议时间步长：{suggested_dt / 60:.1f} 分钟（当前：{dt_minutes:.1f} 分钟）")
 
     if st.session_state.unsteady_result is not None:
         result = st.session_state.unsteady_result
@@ -563,7 +604,8 @@ def unsteady_simulation_tab():
         comp_select = st.selectbox(
             "选择组分",
             ['bod', 'do', 'nh3n', 'cod'],
-            format_func=lambda x: {'bod': 'BOD', 'do': 'DO', 'nh3n': 'NH3-N', 'cod': 'COD'}[x]
+            format_func=lambda x: {'bod': 'BOD', 'do': 'DO', 'nh3n': 'NH3-N', 'cod': 'COD'}[x],
+            key="unsteady_comp"
         )
 
         fig_heatmap = plot_concentration_heatmap(result, comp_select)
@@ -571,13 +613,16 @@ def unsteady_simulation_tab():
 
         st.subheader("📈 时间过程线")
 
-        time_idx = st.slider("选择时刻", 0, len(result['t']) - 1, len(result['t']) // 2)
+        time_idx = st.slider("选择时刻", 0, len(result['t']) - 1, len(result['t']) // 2, key="unsteady_time_idx")
 
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.plot(result['x'], result[comp_select][time_idx, :], 'b-', linewidth=2)
+        if comp_select in WATER_QUALITY_STANDARDS:
+            ax.axhline(y=WATER_QUALITY_STANDARDS[comp_select], color='green', linestyle='--', label='III类标准')
         ax.set_xlabel('河流距离 (m)')
         ax.set_ylabel(f'{comp_select.upper()} 浓度 (mg/L)')
         ax.set_title(f't = {result["t"][time_idx] / 3600:.2f} 小时时的浓度分布')
+        ax.legend()
         ax.grid(True, alpha=0.3)
         st.pyplot(fig, use_container_width=True)
 
@@ -591,14 +636,14 @@ def calibration_tab():
 
     st.subheader("📝 输入实测数据")
 
-    data_input_format = st.radio("数据输入方式", ["手动输入", "表格编辑"])
+    data_input_format = st.radio("数据输入方式", ["手动输入", "表格编辑"], key="cal_input_format")
+
+    x_data = []
+    bod_data = []
+    do_data = []
 
     if data_input_format == "手动输入":
-        n_points = st.number_input("监测断面数量", min_value=3, max_value=20, value=5)
-
-        x_data = []
-        bod_data = []
-        do_data = []
+        n_points = st.number_input("监测断面数量", min_value=3, max_value=20, value=5, key="cal_npoints")
 
         cols = st.columns(3)
         for i in range(n_points):
@@ -618,16 +663,21 @@ def calibration_tab():
             'BOD(mg/L)': [5.0, 4.2, 3.5, 3.0, 2.6, 2.3],
             'DO(mg/L)': [7.5, 6.2, 5.5, 5.2, 5.4, 5.8],
         })
-        edited_df = st.data_editor(df, num_rows="dynamic")
+        edited_df = st.data_editor(df, num_rows="dynamic", key="cal_editor")
 
         x_data = edited_df['距离(m)'].tolist()
         bod_data = edited_df['BOD(mg/L)'].tolist()
         do_data = edited_df['DO(mg/L)'].tolist()
 
-    u = st.slider("河段平均流速 (m/s)", 0.1, 5.0, 0.5, 0.1)
-    L0 = st.number_input("初始BOD浓度 L0 (mg/L)", value=5.0)
-    D0 = st.number_input("初始DO浓度 D0 (mg/L)", value=7.5)
-    D_sat = st.number_input("饱和溶解氧 (mg/L)", value=9.5)
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        u = st.slider("河段平均流速 (m/s)", 0.1, 5.0, 0.5, 0.1, key="cal_u")
+    with col2:
+        L0 = st.number_input("初始BOD浓度 L0 (mg/L)", value=5.0, key="cal_L0")
+    with col3:
+        D0 = st.number_input("初始DO浓度 D0 (mg/L)", value=7.5, key="cal_D0")
+    with col4:
+        D_sat = st.number_input("饱和溶解氧 (mg/L)", value=9.5, key="cal_Dsat")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -635,7 +685,7 @@ def calibration_tab():
     with col2:
         calibrate_k2 = st.button("🔬 率定K2 (复氧)")
     with col3:
-        calibrate_joint = st.button("🔬 联合率定K1&K2")
+        calibrate_joint = st.button("🔬 联合率定K1&K2", type="primary")
 
     if calibrate_k1 and len(x_data) >= 3:
         K1, K1_std, r2 = cal.calibrate_k1(
@@ -717,9 +767,9 @@ def calibration_tab():
         plt.tight_layout()
         st.pyplot(fig)
 
-        if st.button("✅ 应用率定参数到模型"):
+        if st.button("✅ 应用率定参数到模型", key="apply_cal_params"):
             sim.set_water_quality_params(K1=result.K1, K2=result.K2)
-            st.success("参数已应用！")
+            st.success(f"参数已应用！K1={result.K1:.4f}, K2={result.K2:.4f}")
 
 
 def scenario_analysis_tab():
@@ -734,46 +784,179 @@ def scenario_analysis_tab():
     with col1:
         st.subheader("📋 情景列表")
 
-        scenario_name = st.text_input("新情景名称", "改进方案1")
+        scenario_name = st.text_input("新情景名称", "改进方案1", key="sc_new_name")
+        scenario_desc = st.text_area("情景描述", "", key="sc_desc")
 
-        if st.button("➕ 添加当前状态为情景"):
-            scenario = Scenario(name=scenario_name)
-            scenario.upstream_flow = 10.0
-            scenario.K1 = sim.wq_model.params.K1
-            scenario.K2 = sim.wq_model.params.K2
+        st.subheader("情景参数设置")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sc_Q = st.slider("上游流量 (m³/s)", 0.1, 50.0, 10.0, 0.5, key="sc_Q")
+            sc_K1 = st.slider("K1 (1/d)", 0.01, 2.0, sim.wq_model.params.K1, 0.01, key="sc_K1")
+            sc_K2 = st.slider("K2 (1/d)", 0.01, 5.0, sim.wq_model.params.K2, 0.01, key="sc_K2")
+        with col_b:
+            sc_bod = st.slider("上游BOD (mg/L)", 0.0, 20.0, 2.0, 0.5, key="sc_bod")
+            sc_do = st.slider("上游DO (mg/L)", 0.0, 15.0, 8.5, 0.1, key="sc_do")
+            sc_nh3n = st.slider("上游NH3-N (mg/L)", 0.0, 10.0, 0.5, 0.1, key="sc_nh3n")
+            sc_cod = st.slider("上游COD (mg/L)", 0.0, 50.0, 5.0, 0.5, key="sc_cod")
+
+        st.subheader("点源调整")
+        n_sc_sources = st.number_input("该情景点源数量", min_value=0, max_value=10, value=0, key="sc_n_sources")
+
+        sc_sources = []
+        for i in range(n_sc_sources):
+            with st.expander(f"情景点源 {i+1}"):
+                src_name = st.text_input(f"名称", f"排污口{i+1}", key=f"sc_src_name_{i}")
+                src_x = st.number_input(f"位置 (m)", 0.0, 20000.0, 3000.0, key=f"sc_src_x_{i}")
+                src_q = st.slider(f"排放流量 (m³/s)", 0.0, 5.0, 0.5, key=f"sc_src_q_{i}")
+                src_bod = st.slider(f"BOD (mg/L)", 0.0, 200.0, 50.0, key=f"sc_src_bod_{i}")
+                src_do = st.slider(f"DO (mg/L)", 0.0, 10.0, 2.0, key=f"sc_src_do_{i}")
+                src_nh3n = st.slider(f"NH3-N (mg/L)", 0.0, 50.0, 10.0, key=f"sc_src_nh3n_{i}")
+                src_cod = st.slider(f"COD (mg/L)", 0.0, 200.0, 80.0, key=f"sc_src_cod_{i}")
+
+                sc_sources.append({
+                    'name': src_name, 'x': src_x, 'flow_rate': src_q,
+                    'bod': src_bod, 'do': src_do, 'nh3n': src_nh3n, 'cod': src_cod
+                })
+
+        st.subheader("面源调整")
+        n_sc_nps = st.number_input("该情景面源数量", min_value=0, max_value=5, value=0, key="sc_n_nps")
+
+        sc_nonpoint_sources = []
+        for i in range(n_sc_nps):
+            with st.expander(f"情景面源 {i+1}"):
+                nps_name = st.text_input(f"名称", f"农业面源{i+1}", key=f"sc_nps_name_{i}")
+                nps_start = st.number_input(f"起始位置 (m)", 0.0, 20000.0, 1000.0, key=f"sc_nps_start_{i}")
+                nps_end = st.number_input(f"终止位置 (m)", 0.0, 20000.0, 8000.0, key=f"sc_nps_end_{i}")
+                nps_area = st.slider(f"汇水面积 (km²)", 0.1, 50.0, 5.0, key=f"sc_nps_area_{i}")
+                nps_bod = st.slider(f"BOD负荷 (kg/km²·d)", 0.0, 200.0, 30.0, key=f"sc_nps_bod_{i}")
+                nps_nh3n = st.slider(f"NH3-N负荷 (kg/km²·d)", 0.0, 50.0, 5.0, key=f"sc_nps_nh3n_{i}")
+                nps_cod = st.slider(f"COD负荷 (kg/km²·d)", 0.0, 200.0, 50.0, key=f"sc_nps_cod_{i}")
+
+                sc_nonpoint_sources.append({
+                    'name': nps_name, 'start_x': nps_start, 'end_x': nps_end,
+                    'area': nps_area * 1e6,
+                    'bod_load': nps_bod, 'nh3n_load': nps_nh3n, 'cod_load': nps_cod
+                })
+
+        st.subheader("突发源调整")
+        n_sc_acc = st.number_input("该情景突发源数量", min_value=0, max_value=3, value=0, key="sc_n_acc")
+
+        sc_accidental_sources = []
+        for i in range(n_sc_acc):
+            with st.expander(f"情景突发源 {i+1}"):
+                acc_name = st.text_input(f"名称", f"泄漏{i+1}", key=f"sc_acc_name_{i}")
+                acc_x = st.number_input(f"位置 (m)", 0.0, 20000.0, 5000.0, key=f"sc_acc_x_{i}")
+                acc_type = st.selectbox(
+                    f"排放类型",
+                    ['continuous', 'instantaneous'],
+                    key=f"sc_acc_type_{i}",
+                    format_func=lambda x: '持续排放' if x == 'continuous' else '瞬时排放'
+                )
+                acc_bod = st.slider(f"BOD总量 (kg)", 10.0, 10000.0, 2000.0, key=f"sc_acc_bod_{i}")
+                acc_nh3n = st.slider(f"NH3-N总量 (kg)", 10.0, 5000.0, 300.0, key=f"sc_acc_nh3n_{i}")
+                acc_cod = st.slider(f"COD总量 (kg)", 10.0, 10000.0, 1500.0, key=f"sc_acc_cod_{i}")
+                if acc_type == 'continuous':
+                    acc_dur = st.slider(f"排放时长 (小时)", 0.1, 24.0, 4.0, key=f"sc_acc_dur_{i}")
+                    acc_flow = st.slider(f"排放流量 (m³/s)", 0.0, 2.0, 0.5, key=f"sc_acc_flow_{i}")
+                else:
+                    acc_dur = 1.0
+                    acc_flow = 0.0
+
+                sc_accidental_sources.append({
+                    'name': acc_name, 'x': acc_x, 'release_type': acc_type,
+                    'total_mass_bod': acc_bod * 1000,
+                    'total_mass_nh3n': acc_nh3n * 1000,
+                    'total_mass_cod': acc_cod * 1000,
+                    'release_duration': acc_dur * 3600 if acc_type == 'continuous' else 1.0,
+                    'flow_rate': acc_flow
+                })
+
+        is_baseline = st.checkbox("设为基准情景", value=len(sc_manager.scenarios) == 0, key="sc_baseline")
+
+        if st.button("➕ 添加情景"):
+            scenario = Scenario(
+                name=scenario_name,
+                description=scenario_desc,
+                is_baseline=is_baseline
+            )
+            scenario.upstream_flow = sc_Q
+            scenario.upstream_bod = sc_bod
+            scenario.upstream_do = sc_do
+            scenario.upstream_nh3n = sc_nh3n
+            scenario.upstream_cod = sc_cod
+            scenario.K1 = sc_K1
+            scenario.K2 = sc_K2
+            scenario.point_sources = sc_sources
+            scenario.nonpoint_sources = sc_nonpoint_sources
+            scenario.accidental_sources = sc_accidental_sources
             sc_manager.add_scenario(scenario)
-            st.success(f"情景 '{scenario_name}' 已添加")
+            st.success(f"情景 '{scenario_name}' 已添加 (含{len(sc_sources)}个点源, {len(sc_nonpoint_sources)}个面源, {len(sc_accidental_sources)}个突发源)")
 
         scenario_names = sc_manager.get_scenario_names()
         if scenario_names:
-            selected = st.selectbox("选择情景", scenario_names)
+            selected = st.selectbox("选择情景", scenario_names, key="sc_select")
             if st.button("❌ 删除选中情景"):
                 sc_manager.remove_scenario(selected)
                 st.rerun()
 
     with col2:
-        st.subheader("⚙️ 情景参数调整")
+        st.subheader("⚙️ 运行对比模拟")
         if len(scenario_names) > 0:
-            baseline_name = st.selectbox("基准情景", scenario_names)
-            compare_names = st.multiselect("对比情景", scenario_names, default=scenario_names)
+            compare_names = st.multiselect("选择对比情景", scenario_names, default=scenario_names, key="sc_compare")
 
-            if st.button("🔄 运行对比模拟"):
-                results = []
-                for name in compare_names:
-                    scenario = next((s for s in sc_manager.scenarios if s.name == name), None)
-                    if scenario:
-                        sim.set_water_quality_params(K1=scenario.K1, K2=scenario.K2)
-                        result = sim.run_steady_simulation(
-                            Q_upstream=scenario.upstream_flow,
-                            initial_bod=scenario.upstream_bod,
-                            initial_do=scenario.upstream_do,
-                            initial_nh3n=scenario.upstream_nh3n,
-                            initial_cod=scenario.upstream_cod,
-                        )
-                        result['scenario_name'] = name
-                        results.append(result)
+            if st.button("🔄 运行对比模拟", type="primary"):
+                with st.spinner("正在运行多情景模拟..."):
+                    results = []
+                    for name in compare_names:
+                        scenario = next((s for s in sc_manager.scenarios if s.name == name), None)
+                        if scenario:
+                            temp_sim = RiverSimulation()
+                            temp_sim.setup_default_channel()
+                            temp_sim.channel = sim.channel
+                            temp_sim.hydro = sim.hydro
+                            temp_sim.set_water_quality_params(
+                                K1=scenario.K1, K2=scenario.K2,
+                                Dx=sim.wq_model.params.Dx,
+                                D_O_sat=sim.wq_model.params.D_O_sat
+                            )
 
-                st.session_state.comparison_results = results
+                            for ps in scenario.point_sources:
+                                temp_sim.add_point_source(
+                                    ps['name'], ps['x'], ps['flow_rate'],
+                                    ps['bod'], ps['do'], ps['nh3n'], ps['cod']
+                                )
+
+                            for nps in scenario.nonpoint_sources:
+                                temp_sim.add_nonpoint_source(
+                                    nps['name'], nps['start_x'], nps['end_x'],
+                                    area=nps['area'],
+                                    bod_load=nps['bod_load'],
+                                    nh3n_load=nps['nh3n_load'],
+                                    cod_load=nps['cod_load']
+                                )
+
+                            for acc in scenario.accidental_sources:
+                                temp_sim.add_accidental_source(
+                                    acc['name'], acc['x'], acc['release_type'],
+                                    total_mass_bod=acc['total_mass_bod'],
+                                    total_mass_nh3n=acc['total_mass_nh3n'],
+                                    total_mass_cod=acc['total_mass_cod'],
+                                    release_duration=acc['release_duration'],
+                                    flow_rate=acc.get('flow_rate', 0.5)
+                                )
+
+                            result = temp_sim.run_steady_simulation(
+                                Q_upstream=scenario.upstream_flow,
+                                initial_bod=scenario.upstream_bod,
+                                initial_do=scenario.upstream_do,
+                                initial_nh3n=scenario.upstream_nh3n,
+                                initial_cod=scenario.upstream_cod,
+                            )
+                            result['scenario_name'] = name
+                            results.append(result)
+
+                    st.session_state.comparison_results = results
 
     if 'comparison_results' in st.session_state and st.session_state.comparison_results:
         st.subheader("📊 对比结果")
@@ -798,6 +981,8 @@ def scenario_analysis_tab():
                 '最低DO (mg/L)': f"{np.min(result['do']):.3f}",
                 '最大NH3-N (mg/L)': f"{np.max(result['nh3n']):.3f}",
                 '最大COD (mg/L)': f"{np.max(result['cod']):.3f}",
+                '临界点位置 (m)': f"{result.get('critical_x', '-')}",
+                '临界DO (mg/L)': f"{result.get('critical_do', '-'):.3f}" if result.get('critical_do') else '-',
             })
 
         st.table(pd.DataFrame(table_data))
@@ -840,12 +1025,28 @@ def report_export_tab():
 
     if st.session_state.result is not None:
         result = st.session_state.result
+        sim = st.session_state.simulation
 
         st.subheader("📄 生成PDF报告")
 
-        report_title = st.text_input("报告标题", "河流水质模拟分析报告")
+        report_title = st.text_input("报告标题", "河流水质模拟分析报告", key="report_title")
 
-        if st.button("📄 生成PDF报告"):
+        current_params = st.session_state.get('current_wq_params', {
+            'K1': sim.wq_model.params.K1,
+            'K2': sim.wq_model.params.K2,
+            'K_nh3n': sim.wq_model.params.K_nh3n,
+            'K_cod': sim.wq_model.params.K_cod,
+            'Dx': sim.wq_model.params.Dx,
+            'D_O_sat': sim.wq_model.params.D_O_sat,
+        })
+
+        st.info(f"当前参数：K1={current_params.get('K1', sim.wq_model.params.K1):.4f} 1/d, "
+                f"K2={current_params.get('K2', sim.wq_model.params.K2):.4f} 1/d, "
+                f"K_nh3n={current_params.get('K_nh3n', sim.wq_model.params.K_nh3n):.4f} 1/d, "
+                f"K_cod={current_params.get('K_cod', sim.wq_model.params.K_cod):.4f} 1/d, "
+                f"Dx={current_params.get('Dx', sim.wq_model.params.Dx):.1f} m²/s")
+
+        if st.button("📄 生成PDF报告", type="primary"):
             with st.spinner("正在生成报告..."):
                 generator = ReportGenerator()
 
@@ -865,11 +1066,15 @@ def report_export_tab():
                         '河道总长度': f"{result['x'][-1] - result['x'][0]:.0f} m",
                         '平均水深': f"{np.mean(result['h']):.3f} m",
                         '平均流速': f"{np.mean(result['V']):.3f} m/s",
+                        '平均流量': f"{np.mean(result['Q']):.3f} m³/s",
+                        '数值方案': result.get('wq_scheme', 'upwind'),
                     },
-                    'K1': 0.25,
-                    'K2': 0.5,
-                    'Dx': 10.0,
-                    'D_O_sat': 9.5,
+                    'K1': current_params.get('K1', sim.wq_model.params.K1),
+                    'K2': current_params.get('K2', sim.wq_model.params.K2),
+                    'K_nh3n': current_params.get('K_nh3n', sim.wq_model.params.K_nh3n),
+                    'K_cod': current_params.get('K_cod', sim.wq_model.params.K_cod),
+                    'Dx': current_params.get('Dx', sim.wq_model.params.Dx),
+                    'D_O_sat': current_params.get('D_O_sat', sim.wq_model.params.D_O_sat),
                 }
 
                 pdf_bytes = generator.generate_report(params, result, figures)

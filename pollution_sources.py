@@ -90,10 +90,12 @@ class NonPointSource(PollutionSource):
         }
 
     def get_distributed_load(self, x: np.ndarray) -> Dict[str, np.ndarray]:
-        """获取分布在空间上的负荷"""
+        """获取分布在空间上的负荷
+        单位换算：
+        输入: self.area (m²), self.bod_load (kg/km²·d)
+        输出: g/(m·s) - 单位河流长度上的质量输入率
+        """
         dx = x[1] - x[0] if len(x) > 1 else 1.0
-        length = self.end_x - self.start_x
-        n_segments = max(int(length / dx), 1)
 
         bod_dist = np.zeros_like(x)
         nh3n_dist = np.zeros_like(x)
@@ -103,9 +105,16 @@ class NonPointSource(PollutionSource):
         total_length = np.sum(mask) * dx if np.sum(mask) > 0 else 1.0
 
         if total_length > 0:
-            bod_dist[mask] = (self.area * self.bod_load) / total_length
-            nh3n_dist[mask] = (self.area * self.nh3n_load) / total_length
-            cod_dist[mask] = (self.area * self.cod_load) / total_length
+            area_km2 = self.area / 1e6
+            kg_per_day_to_g_per_s = 1000.0 / 86400.0
+
+            bod_total_g_per_s = area_km2 * self.bod_load * kg_per_day_to_g_per_s
+            nh3n_total_g_per_s = area_km2 * self.nh3n_load * kg_per_day_to_g_per_s
+            cod_total_g_per_s = area_km2 * self.cod_load * kg_per_day_to_g_per_s
+
+            bod_dist[mask] = bod_total_g_per_s / total_length
+            nh3n_dist[mask] = nh3n_total_g_per_s / total_length
+            cod_dist[mask] = cod_total_g_per_s / total_length
 
         return {
             'bod': bod_dist,
