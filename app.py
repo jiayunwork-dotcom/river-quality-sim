@@ -2196,14 +2196,14 @@ def trend_analysis_tab():
                         if cause_result.get('param_deviations'):
                             st.markdown("#### 📋 参数偏差详情")
                             dev_table = []
-                            for pd in cause_result['param_deviations']:
+                            for dev in cause_result['param_deviations']:
                                 dev_table.append({
-                                    '参数名称': pd['param_label'],
-                                    '异常值': f"{pd['anomaly_value']:.4f}",
-                                    '正常中位数': f"{pd['normal_median']:.4f}",
-                                    '偏差方向': pd['direction'],
-                                    '偏差百分比': f"{pd['deviation_percent']:+.1f}%",
-                                    '标准化偏差': f"{pd['standardized_deviation']:.2f}"
+                                    '参数名称': dev['param_label'],
+                                    '异常值': f"{dev['anomaly_value']:.4f}",
+                                    '正常中位数': f"{dev['normal_median']:.4f}",
+                                    '偏差方向': dev['direction'],
+                                    '偏差百分比': f"{dev['deviation_percent']:+.1f}%",
+                                    '标准化偏差': f"{dev['standardized_deviation']:.2f}"
                                 })
                             df_dev = pd.DataFrame(dev_table)
 
