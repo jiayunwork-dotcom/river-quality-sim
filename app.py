@@ -19,6 +19,14 @@ from simulation_engine import RiverSimulation
 from calibration import ParameterCalibration, CalibrationData
 from scenario_analysis import Scenario, ScenarioManager
 from report_generator import ReportGenerator
+from warning_module import (
+    WarningThreshold, WarningRules, EmergencyMeasure,
+    WarningHistory, WARNING_NORMAL, WARNING_BLUE, WARNING_ORANGE, WARNING_RED,
+    WARNING_NAMES, WARNING_COLORS, WARNING_COLORS_LIGHT,
+    evaluate_warnings, plot_river_warning_schematic,
+    plot_dashboard_ring_chart, build_stats_cards_data,
+    run_emergency_simulation,
+)
 
 rcParams['font.sans-serif'] = ['DejaVu Sans']
 rcParams['axes.unicode_minus'] = False
@@ -258,6 +266,33 @@ def init_session_state():
 
     if 'auto_run' not in st.session_state:
         st.session_state.auto_run = True
+
+    if 'warning_rules' not in st.session_state:
+        st.session_state.warning_rules = WarningRules()
+
+    if 'warning_data' not in st.session_state:
+        st.session_state.warning_data = None
+
+    if 'warning_history' not in st.session_state:
+        st.session_state.warning_history = WarningHistory(max_records=20)
+
+    if 'emergency_measures' not in st.session_state:
+        st.session_state.emergency_measures = []
+
+    if 'emergency_result' not in st.session_state:
+        st.session_state.emergency_result = None
+
+    if 'emergency_warning_data' not in st.session_state:
+        st.session_state.emergency_warning_data = None
+
+    if 'emergency_sim' not in st.session_state:
+        st.session_state.emergency_sim = None
+
+    if 'warning_hover_idx' not in st.session_state:
+        st.session_state.warning_hover_idx = None
+
+    if 'steady_sim_params' not in st.session_state:
+        st.session_state.steady_sim_params = {}
 
 
 def plot_water_quality_profile(result, components=None):
@@ -629,9 +664,9 @@ def main_page():
     st.title("🌊 河流水质动态模拟与污染物迁移预测系统")
     st.markdown("---")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 稳态模拟", "⏱️ 非稳态模拟", "📈 参数率定",
-        "🔄 情景分析", "📋 结果表格", "📄 报告导出"
+        "🔄 情景分析", "⚠️ 预警与应急响应", "📋 结果表格", "📄 报告导出"
     ])
 
     with tab1:
@@ -647,9 +682,12 @@ def main_page():
         scenario_analysis_tab()
 
     with tab5:
-        results_table_tab()
+        warning_emergency_tab()
 
     with tab6:
+        results_table_tab()
+
+    with tab7:
         report_export_tab()
 
 
@@ -720,6 +758,16 @@ def steady_simulation_tab():
                 wq_scheme=wq_scheme,
             )
             st.session_state.result = result
+            st.session_state.steady_sim_params = {
+                'Q_upstream': Q_upstream,
+                'initial_bod': initial_bod,
+                'initial_do': initial_do,
+                'initial_nh3n': initial_nh3n,
+                'initial_cod': initial_cod,
+                'flow_mode': flow_mode,
+                'n_grid': n_grid,
+                'wq_scheme': wq_scheme,
+            }
 
     if st.session_state.result is not None:
         result = st.session_state.result
@@ -1484,6 +1532,325 @@ def report_export_tab():
                 )
     else:
         st.info("请先运行模拟")
+
+
+def warning_emergency_tab():
+    """水质预警与应急响应标签页"""
+    st.header("⚠️ 水质预警与应急响应")
+
+    sim = st.session_state.simulation
+    result = st.session_state.result
+    rules = st.session_state.warning_rules
+
+    if result is None:
+        st.warning("⚠️ 请先在【稳态模拟】标签页运行一次稳态模拟，然后再使用本模块")
+        st.info("💡 步骤：1) 设置河道、水质参数和污染源 → 2) 运行稳态模拟 → 3) 返回本页设置预警")
+        return
+
+    x = result['x']
+    x_min, x_max = x[0], x[-1]
+
+    st.markdown("### 1️⃣ 预警规则配置面板")
+    col_rules1, col_rules2, col_rules3 = st.columns(3)
+
+    with col_rules1:
+        st.markdown("#### 🧪 BOD 阈值 (越低越好)")
+        st.caption("单位: mg/L | 蓝:轻度 | 橙:超标 | 红:严重超标")
+        bod_blue_low = st.number_input("BOD-蓝色下限", 0.0, 20.0, rules.bod.blue_low, 0.1, key="w_bod_blue_low")
+        bod_blue_high = st.number_input("BOD-蓝色上限(=橙色下限)", 0.0, 20.0, rules.bod.blue_high, 0.1, key="w_bod_blue_high")
+        bod_orange_high = st.number_input("BOD-橙色上限(=红色阈值)", 0.0, 50.0, rules.bod.red_threshold, 0.1, key="w_bod_red")
+        rules.bod = WarningThreshold(
+            blue_low=bod_blue_low, blue_high=bod_blue_high,
+            orange_low=bod_blue_high, orange_high=bod_orange_high,
+            red_threshold=bod_orange_high, is_lower_better=True
+        )
+
+    with col_rules2:
+        st.markdown("#### 💧 DO 阈值 (越高越好)")
+        st.caption("单位: mg/L | 蓝:接近标准 | 橙:低于标准 | 红:严重缺氧")
+        do_red = st.number_input("DO-红色阈值(≤此值为红)", 0.0, 15.0, rules.do.red_threshold, 0.1, key="w_do_red")
+        do_orange_high = st.number_input("DO-橙色上限", 0.0, 15.0, rules.do.orange_high, 0.1, key="w_do_orange_high")
+        do_blue_high = st.number_input("DO-蓝色上限(>此值为正常)", 0.0, 15.0, rules.do.blue_high, 0.1, key="w_do_blue_high")
+        rules.do = WarningThreshold(
+            blue_low=do_orange_high, blue_high=do_blue_high,
+            orange_low=do_red, orange_high=do_orange_high,
+            red_threshold=do_red, is_lower_better=False
+        )
+
+    with col_rules3:
+        st.markdown("#### 🔬 NH3-N 阈值 (越低越好)")
+        st.caption("单位: mg/L | 蓝:轻度 | 橙:超标 | 红:严重超标")
+        nh3n_blue_low = st.number_input("NH3-N-蓝色下限", 0.0, 10.0, rules.nh3n.blue_low, 0.05, key="w_nh3n_blue_low")
+        nh3n_blue_high = st.number_input("NH3-N-蓝色上限(=橙色下限)", 0.0, 10.0, rules.nh3n.blue_high, 0.05, key="w_nh3n_blue_high")
+        nh3n_orange_high = st.number_input("NH3-N-橙色上限(=红色阈值)", 0.0, 20.0, rules.nh3n.red_threshold, 0.05, key="w_nh3n_red")
+        rules.nh3n = WarningThreshold(
+            blue_low=nh3n_blue_low, blue_high=nh3n_blue_high,
+            orange_low=nh3n_blue_high, orange_high=nh3n_orange_high,
+            red_threshold=nh3n_orange_high, is_lower_better=True
+        )
+
+    col_btn_apply, col_btn_reset = st.columns([1, 1])
+    with col_btn_apply:
+        apply_rules = st.button("✅ 应用规则", type="primary", use_container_width=True)
+    with col_btn_reset:
+        reset_measures = st.button("🔄 重置应急状态", use_container_width=True)
+
+    if reset_measures:
+        st.session_state.emergency_measures = []
+        st.session_state.emergency_result = None
+        st.session_state.emergency_warning_data = None
+        st.session_state.emergency_sim = None
+        st.success("✅ 应急状态已重置")
+
+    if apply_rules:
+        with st.spinner("正在逐点判定预警级别..."):
+            warning_data = evaluate_warnings(result, rules)
+            st.session_state.warning_data = warning_data
+            st.session_state.warning_history.add_record(
+                record_type='rule',
+                stats=warning_data['stats'],
+                measures_desc='应用预警规则判定'
+            )
+            st.success(f"✅ 规则已应用！共 {warning_data['stats']['total']} 个断面，"
+                       f"红色{warning_data['stats']['red_count']}，"
+                       f"橙色{warning_data['stats']['orange_count']}，"
+                       f"蓝色{warning_data['stats']['blue_count']}，"
+                       f"正常{warning_data['stats']['normal_count']}")
+
+    if st.session_state.warning_data is None:
+        st.info("👆 请先点击上方【应用规则】按钮进行预警判定")
+        return
+
+    warning_data = st.session_state.warning_data
+
+    st.markdown("---")
+    st.markdown("### 2️⃣ 河段预警示意图 & 3️⃣ 应急响应模拟")
+
+    col_river_left, col_river_right = st.columns([3, 1.1])
+
+    with col_river_right:
+        st.markdown("#### 🎯 选择查看位置")
+        hover_pos = st.slider(
+            "滑动选择断面位置 (m)",
+            float(x_min), float(x_max), float(x_min + (x_max - x_min) * 0.3),
+            key="warning_hover_slider"
+        )
+        hover_idx = int(np.argmin(np.abs(x - hover_pos)))
+        st.caption(f"当前网格索引: {hover_idx}/{len(x)-1} | x = {x[hover_idx]:.1f}m")
+
+        st.markdown("---")
+        st.markdown("#### 🛠️ 添加应急措施")
+
+        measure_type = st.selectbox(
+            "措施类型",
+            ['aerator', 'close_source', 'reduce_source'],
+            format_func=lambda x: {
+                'aerator': '💨 投放增氧剂 (增加DO点源)',
+                'close_source': '🚫 临时关闭排污口',
+                'reduce_source': '📉 削减排污口排放',
+            }[x],
+            key="measure_type_select"
+        )
+
+        if measure_type == 'aerator':
+            aerator_x = st.slider("投放位置 (m)", x_min, x_max,
+                                  x_min + (x_max - x_min) * 0.4, key="aerator_x")
+            aerator_do = st.slider("增氧浓度 (mg/L)", 2.0, 15.0, 9.0, 0.5, key="aerator_do")
+            aerator_flow = st.slider("注入流量 (m³/s)", 0.05, 2.0, 0.3, 0.05, key="aerator_flow")
+            measure_desc = f"💨 增氧@{aerator_x:.0f}m (DO={aerator_do:.1f}mg/L, Q={aerator_flow:.2f}m³/s)"
+
+        elif measure_type == 'close_source':
+            point_sources = sim.source_manager.get_point_sources()
+            if not point_sources:
+                st.warning("⚠️ 未配置点源排污口，无法关闭")
+                source_name = None
+            else:
+                src_names = [ps.name for ps in point_sources]
+                source_name = st.selectbox("选择排污口", src_names, key="close_source_name")
+            measure_desc = f"🚫 关闭排污口[{source_name}]" if source_name else "无可用排污口"
+
+        else:
+            point_sources = sim.source_manager.get_point_sources()
+            if not point_sources:
+                st.warning("⚠️ 未配置点源排污口，无法削减")
+                source_name = None
+                reduce_ratio = 0.5
+            else:
+                src_names = [ps.name for ps in point_sources]
+                source_name = st.selectbox("选择排污口", src_names, key="reduce_source_name")
+                reduce_ratio = st.slider("削减比例 (%)", 10, 90, 50, 5, key="reduce_ratio") / 100.0
+            measure_desc = f"📉 削减[{source_name}]排放{reduce_ratio*100:.0f}%" if source_name else "无可用排污口"
+
+        col_add, col_clear = st.columns(2)
+        with col_add:
+            add_measure = st.button("➕ 添加", use_container_width=True)
+        with col_clear:
+            clear_measures = st.button("🗑️ 清空", use_container_width=True)
+
+        if add_measure:
+            if measure_type == 'aerator':
+                measure = EmergencyMeasure(
+                    measure_type='aerator',
+                    position=aerator_x,
+                    description=measure_desc,
+                    params={'do_supply': aerator_do, 'flow_inject': aerator_flow}
+                )
+                st.session_state.emergency_measures.append(measure)
+                st.success(f"✅ 已添加: {measure_desc}")
+            elif measure_type in ['close_source', 'reduce_source']:
+                if source_name:
+                    measure = EmergencyMeasure(
+                        measure_type=measure_type,
+                        position=0.0,
+                        description=measure_desc,
+                        params={'source_name': source_name,
+                                'reduce_ratio': reduce_ratio if measure_type == 'reduce_source' else 1.0}
+                    )
+                    st.session_state.emergency_measures.append(measure)
+                    st.success(f"✅ 已添加: {measure_desc}")
+
+        if clear_measures:
+            st.session_state.emergency_measures = []
+            st.session_state.emergency_result = None
+            st.session_state.emergency_warning_data = None
+            st.info("✅ 措施列表已清空")
+
+        if st.session_state.emergency_measures:
+            st.markdown("**📋 已配置措施:**")
+            for i, m in enumerate(st.session_state.emergency_measures):
+                st.caption(f"{i+1}. {m.description}")
+
+        run_emergency = st.button(
+            "🚀 运行应急模拟",
+            type="primary",
+            disabled=len(st.session_state.emergency_measures) == 0,
+            use_container_width=True
+        )
+
+        if run_emergency and st.session_state.steady_sim_params:
+            with st.spinner("正在运行应急模拟..."):
+                base_params = st.session_state.steady_sim_params
+                em_sim, em_result = run_emergency_simulation(
+                    sim=sim,
+                    measures=st.session_state.emergency_measures,
+                    base_kwargs=base_params
+                )
+                em_warning = evaluate_warnings(em_result, rules)
+                st.session_state.emergency_result = em_result
+                st.session_state.emergency_warning_data = em_warning
+                st.session_state.emergency_sim = em_sim
+
+                measures_text = "; ".join([m.description for m in st.session_state.emergency_measures])
+                st.session_state.warning_history.add_record(
+                    record_type='emergency',
+                    stats=em_warning['stats'],
+                    measures_desc=measures_text
+                )
+
+                before_red = warning_data['stats']['red_count']
+                after_red = em_warning['stats']['red_count']
+                delta = before_red - after_red
+                if delta > 0:
+                    st.success(f"✅ 应急完成！红色预警减少 {delta} 个 ({before_red} → {after_red})")
+                elif delta < 0:
+                    st.warning(f"⚠️ 应急后红色预警增加 {-delta} 个，请检查措施")
+                else:
+                    st.info(f"ℹ️ 应急后红色预警数量不变 ({after_red})")
+
+    with col_river_left:
+        em_result = st.session_state.emergency_result
+        em_warning = st.session_state.emergency_warning_data
+        sim_for_plot = st.session_state.emergency_sim if st.session_state.emergency_sim is not None else sim
+
+        fig_schematic = plot_river_warning_schematic(
+            result=result,
+            warning_data=warning_data,
+            sim=sim_for_plot,
+            result_emergency=em_result,
+            warning_emergency=em_warning,
+            hover_idx=hover_idx,
+            figsize=(14, 5)
+        )
+        st.pyplot(fig_schematic, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### 4️⃣ 预警统计仪表盘")
+
+    em_stats = em_warning['stats'] if em_warning is not None else None
+    cards_data = build_stats_cards_data(warning_data['stats'], em_stats)
+
+    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+
+    def render_stat_card(col, key, name, emoji, color):
+        b = cards_data['before']
+        with col:
+            with st.container():
+                st.markdown(f"<div style='padding:15px; border-radius:12px; "
+                            f"border:2px solid {color}; background-color:{color}15;'>",
+                            unsafe_allow_html=True)
+                st.markdown(f"<h4 style='margin:0; color:{color};'>{emoji} {name}</h4>", unsafe_allow_html=True)
+                st.markdown(f"<h2 style='margin:5px 0; color:{color}; font-weight:bold;'>"
+                            f"{b[key]} <span style='font-size:14px;'>个</span></h2>", unsafe_allow_html=True)
+                st.markdown(f"<p style='margin:0; color:#666; font-size:13px;'>"
+                            f"占比: <b>{b[f'{key}_pct']:.1f}%</b></p>", unsafe_allow_html=True)
+                if 'after' in cards_data:
+                    a = cards_data['after']
+                    trend_icon = a[f'{key}_trend']
+                    trend_color = a[f'{key}_trend_color']
+                    diff_val = a[f'{key}_diff']
+                    sign = "+" if diff_val > 0 else ""
+                    st.markdown(
+                        f"<p style='margin:8px 0 0 0; padding:6px 10px; border-radius:8px; "
+                        f"background-color:{trend_color}18; border:1px solid {trend_color}50;'>"
+                        f"<span style='font-size:18px; color:{trend_color}; font-weight:bold;'>"
+                        f"应急后: {a[key]}个 {trend_icon}{sign}{diff_val}</span></p>",
+                        unsafe_allow_html=True
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    render_stat_card(col_c1, 'red', '红色预警', '🔴', WARNING_COLORS[WARNING_RED])
+    render_stat_card(col_c2, 'orange', '橙色预警', '🟠', WARNING_COLORS[WARNING_ORANGE])
+    render_stat_card(col_c3, 'blue', '蓝色预警', '🔵', WARNING_COLORS[WARNING_BLUE])
+    render_stat_card(col_c4, 'normal', '正常断面', '🟢', WARNING_COLORS[WARNING_NORMAL])
+
+    st.markdown("")
+    fig_ring = plot_dashboard_ring_chart(warning_data['stats'], em_stats)
+    st.pyplot(fig_ring, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### 5️⃣ 预警历史记录")
+    st.caption(f"最多保留最近 {st.session_state.warning_history.max_records} 条记录")
+
+    if not st.session_state.warning_history.is_empty():
+        df_history = st.session_state.warning_history.to_dataframe()
+
+        def highlight_rows(row):
+            styles = pd.Series('', index=row.index)
+            if row['记录类型'] == '应急模拟':
+                styles = 'background-color: #eaf2f8;'
+            elif row['记录类型'] == '规则应用':
+                styles = 'background-color: #fef9e7;'
+            return styles
+
+        styled_history = df_history.style.apply(highlight_rows, axis=1)
+        st.dataframe(styled_history, use_container_width=True, hide_index=True, height=360)
+
+        col_h1, col_h2, _ = st.columns([1, 1, 4])
+        with col_h1:
+            csv_bytes = st.session_state.warning_history.to_csv()
+            st.download_button(
+                "📥 导出CSV",
+                csv_bytes,
+                f"warning_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        with col_h2:
+            if st.button("🗑️ 清空历史", use_container_width=True):
+                st.session_state.warning_history = WarningHistory(max_records=20)
+                st.rerun()
+    else:
+        st.info("📭 暂无历史记录，点击【应用规则】或【运行应急模拟】后记录将自动保存")
 
 
 def main():
