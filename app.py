@@ -8,6 +8,7 @@ import pandas as pd
 import io
 import sys
 import os
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -19,6 +20,10 @@ from simulation_engine import RiverSimulation
 from calibration import ParameterCalibration, CalibrationData
 from scenario_analysis import Scenario, ScenarioManager
 from report_generator import ReportGenerator
+from trend_analysis import (
+    SimulationHistory, moving_average, detect_anomalies,
+    compute_spearman_correlation, compute_summary_stats
+)
 from warning_module import (
     WarningThreshold, WarningRules, EmergencyMeasure,
     WarningHistory, WARNING_NORMAL, WARNING_BLUE, WARNING_ORANGE, WARNING_RED,
@@ -313,6 +318,12 @@ def init_session_state():
 
     if 'batch_recommend_mode' not in st.session_state:
         st.session_state.batch_recommend_mode = 'cost_min'
+
+    if 'simulation_history' not in st.session_state:
+        st.session_state.simulation_history = SimulationHistory(max_records=50)
+
+    if 'trend_selected_ids' not in st.session_state:
+        st.session_state.trend_selected_ids = []
 
 
 def plot_water_quality_profile(result, components=None):
@@ -684,9 +695,11 @@ def main_page():
     st.title("🌊 河流水质动态模拟与污染物迁移预测系统")
     st.markdown("---")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 稳态模拟", "⏱️ 非稳态模拟", "📈 参数率定",
-        "🔄 情景分析", "⚠️ 预警与应急响应", "📋 结果表格", "📄 报告导出"
+        "🔄 情景分析", "⚠️ 预警与应急响应",
+        "📉 水质趋势分析与异常检测",
+        "📋 结果表格", "📄 报告导出"
     ])
 
     with tab1:
@@ -705,9 +718,12 @@ def main_page():
         warning_emergency_tab()
 
     with tab6:
-        results_table_tab()
+        trend_analysis_tab()
 
     with tab7:
+        results_table_tab()
+
+    with tab8:
         report_export_tab()
 
 
@@ -788,6 +804,32 @@ def steady_simulation_tab():
                 'n_grid': n_grid,
                 'wq_scheme': wq_scheme,
             }
+
+            wq_params = st.session_state.get('current_wq_params', {})
+            history_params = {
+                'Q_upstream': Q_upstream,
+                'initial_bod': initial_bod,
+                'initial_do': initial_do,
+                'initial_nh3n': initial_nh3n,
+                'K1': wq_params.get('K1', sim.wq_model.params.K1),
+                'K2': wq_params.get('K2', sim.wq_model.params.K2),
+                'Dx': wq_params.get('Dx', sim.wq_model.params.Dx),
+                'point_source_count': len(sim.source_manager.get_point_sources()),
+                'nonpoint_source_count': len(sim.source_manager.get_nonpoint_sources()),
+            }
+            ps_list = sim.source_manager.get_point_sources()
+            if len(ps_list) > 0:
+                history_params['ps1_flow'] = ps_list[0].flow_rate
+                history_params['ps1_bod'] = ps_list[0].bod_conc
+                history_params['ps1_nh3n'] = ps_list[0].nh3n_conc
+
+            st.session_state.simulation_history.add_record(
+                params=history_params,
+                x=result['x'],
+                bod=result['bod'],
+                do=result['do'],
+                nh3n=result['nh3n'],
+            )
 
     if st.session_state.result is not None:
         result = st.session_state.result
@@ -1552,6 +1594,408 @@ def report_export_tab():
                 )
     else:
         st.info("请先运行模拟")
+
+
+def plot_section_trend(records, section_idx, ma_window):
+    """绘制断面趋势图"""
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    n_records = len(records)
+    x_indices = np.arange(1, n_records + 1)
+
+    bod_vals = np.array([r.bod[section_idx] for r in records])
+    nh3n_vals = np.array([r.nh3n[section_idx] for r in records])
+    do_vals = np.array([r.do[section_idx] for r in records])
+
+    ax1.set_xlabel('模拟记录编号', fontsize=12)
+    ax1.set_ylabel('BOD / NH3-N 浓度 (mg/L)', fontsize=12, color='#2c3e50')
+
+    line1, = ax1.plot(x_indices, bod_vals, 'o-', color='#e74c3c', linewidth=2, markersize=6, label='BOD')
+    line2, = ax1.plot(x_indices, nh3n_vals, 's-', color='#f39c12', linewidth=2, markersize=6, label='NH3-N')
+
+    if ma_window >= 2 and n_records >= ma_window:
+        bod_ma = moving_average(bod_vals, ma_window)
+        nh3n_ma = moving_average(nh3n_vals, ma_window)
+        ax1.plot(x_indices, bod_ma, '--', color='#e74c3c', linewidth=1.5, alpha=0.6, label=f'BOD MA({ma_window})')
+        ax1.plot(x_indices, nh3n_ma, '--', color='#f39c12', linewidth=1.5, alpha=0.6, label=f'NH3-N MA({ma_window})')
+
+    ax1.tick_params(axis='y', labelcolor='#2c3e50')
+    ax1.grid(True, alpha=0.3, linestyle=':')
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('DO 浓度 (mg/L)', fontsize=12, color='#2980b9')
+    line3, = ax2.plot(x_indices, do_vals, '^-', color='#2980b9', linewidth=2, markersize=6, label='DO')
+
+    if ma_window >= 2 and n_records >= ma_window:
+        do_ma = moving_average(do_vals, ma_window)
+        ax2.plot(x_indices, do_ma, '--', color='#2980b9', linewidth=1.5, alpha=0.6, label=f'DO MA({ma_window})')
+
+    ax2.tick_params(axis='y', labelcolor='#2980b9')
+
+    lines = [line1, line2, line3]
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper left', fontsize=10, framealpha=0.9)
+
+    position = records[0].x[section_idx]
+    ax1.set_title(f'断面 x={position:.0f}m 水质指标趋势图', fontsize=14, fontweight='bold')
+    ax1.set_xticks(x_indices)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_anomaly_heatmap(anomaly_result, component='bod'):
+    """绘制异常检测热力图"""
+    positions = anomaly_result['positions']
+    matrix = anomaly_result['anomaly_matrix'][component]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(positions) * 0.15), max(5, matrix.shape[0] * 0.5)))
+
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    cmap = ListedColormap(['#ffffff', '#f1c40f', '#e74c3c'])
+    bounds = [-0.5, 0.5, 1.5, 2.5]
+    norm = BoundaryNorm(bounds, cmap.N)
+
+    im = ax.imshow(matrix, cmap=cmap, norm=norm, aspect='auto', interpolation='nearest')
+
+    ax.set_xlabel('断面位置 (m)', fontsize=11)
+    ax.set_ylabel('模拟记录编号', fontsize=11)
+
+    n_positions = len(positions)
+    if n_positions > 20:
+        step = max(1, n_positions // 15)
+        tick_positions = np.arange(0, n_positions, step)
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels([f"{positions[i]:.0f}" for i in tick_positions], rotation=45, ha='right', fontsize=8)
+    else:
+        ax.set_xticks(np.arange(n_positions))
+        ax.set_xticklabels([f"{p:.0f}" for p in positions], rotation=45, ha='right', fontsize=9)
+
+    ax.set_yticks(np.arange(matrix.shape[0]))
+    ax.set_yticklabels([f"{i+1}" for i in range(matrix.shape[0])], fontsize=9)
+
+    comp_labels = {'bod': 'BOD', 'nh3n': 'NH3-N', 'do': 'DO'}
+    ax.set_title(f'{comp_labels[component]} 异常检测热力图', fontsize=13, fontweight='bold')
+
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#ffffff', edgecolor='#bdc3c7', label='正常'),
+        Patch(facecolor='#f1c40f', label='轻度异常 (2-3倍MAD)'),
+        Patch(facecolor='#e74c3c', label='严重异常 (>3倍MAD)'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=9, bbox_to_anchor=(1.3, 1))
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_correlation_heatmap(corr_result):
+    """绘制相关性热力图"""
+    all_vars = corr_result['all_vars']
+    corr_matrix = corr_result['corr_matrix']
+    p_matrix = corr_result['p_matrix']
+
+    var_labels = {
+        'K1': 'K1(BOD衰减)',
+        'K2': 'K2(复氧)',
+        'Q_upstream': '上游流量Q',
+        'initial_bod': '上游BOD₀',
+        'initial_do': '上游DO₀',
+        'initial_nh3n': '上游NH3-N₀',
+        'avg_bod': '平均BOD',
+        'min_do': '最低DO',
+        'max_nh3n': '最高NH3-N',
+        'compliance_rate': '达标率',
+    }
+    labels = [var_labels.get(v, v) for v in all_vars]
+    n_vars = len(all_vars)
+
+    fig, ax = plt.subplots(figsize=(max(8, n_vars * 1.2), max(6, n_vars * 1.0)))
+
+    im = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+
+    ax.set_xticks(np.arange(n_vars))
+    ax.set_yticks(np.arange(n_vars))
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_yticklabels(labels, fontsize=9)
+
+    for i in range(n_vars):
+        for j in range(n_vars):
+            val = corr_matrix[i, j]
+            p_val = p_matrix[i, j]
+            color = 'white' if abs(val) > 0.5 else 'black'
+            marker = '*' if p_val < 0.05 else ''
+            ax.text(j, i, f"{val:.2f}{marker}", ha='center', va='center',
+                    fontsize=8, color=color, fontweight='bold' if p_val < 0.05 else 'normal')
+
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Spearman相关系数', fontsize=10)
+
+    ax.set_title('参数-结果 Spearman 秩相关系数矩阵\n(* 表示 p<0.05 显著相关)', fontsize=13, fontweight='bold')
+
+    plt.tight_layout()
+    return fig
+
+
+def trend_analysis_tab():
+    """水质趋势分析与异常检测标签页"""
+    st.header("📉 水质趋势分析与异常检测")
+    st.caption("本模块对多次稳态模拟的历史结果进行统计分析和异常识别。请先在【稳态模拟】Tab中运行至少3次模拟。")
+
+    history = st.session_state.simulation_history
+
+    st.markdown("---")
+    st.subheader("1️⃣ 模拟历史管理")
+
+    if history.is_empty():
+        st.warning("⚠️ 暂无模拟历史记录，请先在【稳态模拟】Tab页运行模拟。每次运行稳态模拟后，结果将自动保存到历史队列（最多50条）。")
+        return
+
+    col_hdr1, col_hdr2, col_hdr3 = st.columns([3, 1, 1])
+    with col_hdr1:
+        st.info(f"📋 当前共有 **{len(history)}** 条历史记录（最多保留50条）")
+    with col_hdr2:
+        select_all = st.button("✅ 全选", use_container_width=True)
+    with col_hdr3:
+        clear_sel = st.button("⬜ 取消全选", use_container_width=True)
+
+    history_df_data = []
+    for idx, rec in enumerate(history.records):
+        history_df_data.append({
+            '编号': rec.record_id,
+            '时间': rec.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            '参数摘要': rec.param_summary(),
+            '达标率(%)': f"{rec.get_compliance_rate(WATER_QUALITY_STANDARDS):.1f}",
+        })
+    df_history = pd.DataFrame(history_df_data)
+
+    all_ids = [rec.record_id for rec in history.records]
+
+    if select_all:
+        st.session_state.trend_selected_ids = all_ids.copy()
+    if clear_sel:
+        st.session_state.trend_selected_ids = []
+
+    with st.expander("📋 查看并选择模拟记录（勾选参与分析的记录）", expanded=True):
+        selected = []
+        cols_per_row = 4
+        rows = [history.records[i:i + cols_per_row] for i in range(0, len(history.records), cols_per_row)]
+        for row in rows:
+            cols = st.columns(cols_per_row)
+            for col, rec in zip(cols, row):
+                with col:
+                    default_checked = rec.record_id in st.session_state.trend_selected_ids
+                    is_checked = st.checkbox(
+                        f"#{rec.record_id} | {rec.timestamp.strftime('%H:%M:%S')}",
+                        value=default_checked,
+                        key=f"hist_check_{rec.record_id}"
+                    )
+                    st.caption(rec.param_summary())
+                    st.caption(f"达标率: {rec.get_compliance_rate(WATER_QUALITY_STANDARDS):.1f}%")
+                    if is_checked:
+                        selected.append(rec.record_id)
+
+        st.session_state.trend_selected_ids = selected
+
+    selected_records = [r for r in history.records if r.record_id in st.session_state.trend_selected_ids]
+    n_selected = len(selected_records)
+
+    can_analyze = n_selected >= 3
+    if not can_analyze:
+        st.error(f"❌ 需要至少3次模拟记录才能开启分析功能。当前已选择 **{n_selected}** 条记录。")
+        return
+
+    st.success(f"✅ 已选择 **{n_selected}** 条记录参与分析")
+
+    st.markdown("---")
+    st.subheader("2️⃣ 趋势统计摘要")
+
+    summary = compute_summary_stats(selected_records, WATER_QUALITY_STANDARDS)
+
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+
+    with col_s1:
+        trend_icon = "📈" if "上升" in summary['compliance_trend'] else ("📉" if "下降" in summary['compliance_trend'] else "➡️")
+        st.markdown(
+            f"<div style='padding:18px; border-radius:14px; border:2px solid #27ae60; "
+            f"background:linear-gradient(135deg,#eafaf1,#d5f5e3);'>"
+            f"<div style='font-size:13px;color:#27ae60;'>平均水质达标率趋势</div>"
+            f"<div style='font-size:26px;font-weight:bold;color:#1e8449;margin-top:6px;'>{trend_icon} {summary['compliance_trend']}</div>"
+            f"<div style='font-size:12px;color:#7f8c8d;margin-top:8px;'>"
+            f"前: {summary['first_rate']:.1f}% → 后: {summary['second_rate']:.1f}%<br>"
+            f"变化: {'+' if summary['rate_change'] > 0 else ''}{summary['rate_change']:.1f}%</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    with col_s2:
+        anomaly_color = '#e74c3c' if summary['anomaly_ratio'] > 5 else ('#f39c12' if summary['anomaly_ratio'] > 1 else '#27ae60')
+        st.markdown(
+            f"<div style='padding:18px; border-radius:14px; border:2px solid {anomaly_color}; "
+            f"background:linear-gradient(135deg,#fdfefe,#f8f9f9);'>"
+            f"<div style='font-size:13px;color:{anomaly_color};'>异常记录占比 (严重异常)</div>"
+            f"<div style='font-size:26px;font-weight:bold;color:{anomaly_color};margin-top:6px;'>{summary['anomaly_ratio']:.2f}%</div>"
+            f"<div style='font-size:12px;color:#7f8c8d;margin-top:8px;'>"
+            f"严重异常点: {summary['anomaly_count']} 个</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    with col_s3:
+        st.markdown(
+            f"<div style='padding:18px; border-radius:14px; border:2px solid #8e44ad; "
+            f"background:linear-gradient(135deg,#f5eef8,#ebdef0);'>"
+            f"<div style='font-size:13px;color:#8e44ad;'>参数波动最大变量</div>"
+            f"<div style='font-size:18px;font-weight:bold;color:#6c3483;margin-top:6px;'>{summary['max_cv_var']}</div>"
+            f"<div style='font-size:12px;color:#7f8c8d;margin-top:8px;'>变异系数最大的输入参数</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    with col_s4:
+        st.markdown(
+            f"<div style='padding:18px; border-radius:14px; border:2px solid #2980b9; "
+            f"background:linear-gradient(135deg,#ebf5fb,#d6eaf8);'>"
+            f"<div style='font-size:13px;color:#2980b9;'>水质最差断面位置</div>"
+            f"<div style='font-size:26px;font-weight:bold;color:#1a5276;margin-top:6px;'>x = {summary['worst_position']}</div>"
+            f"<div style='font-size:12px;color:#7f8c8d;margin-top:8px;'>"
+            f"平均DO最低: {summary['worst_do']:.2f} mg/L</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+    st.subheader("3️⃣ 断面趋势图")
+
+    col_t1, col_t2 = st.columns([2, 1])
+    with col_t1:
+        positions = selected_records[0].x
+        position_labels = [f"x = {p:.0f}m" for p in positions]
+        if len(positions) > 30:
+            step = max(1, len(positions) // 30)
+            display_indices = list(range(0, len(positions), step))
+            display_labels = [position_labels[i] for i in display_indices]
+            selected_label = st.selectbox("选择断面位置", display_labels, key="trend_section_select")
+            section_idx = display_indices[display_labels.index(selected_label)]
+        else:
+            selected_label = st.selectbox("选择断面位置", position_labels, key="trend_section_select")
+            section_idx = position_labels.index(selected_label)
+
+    with col_t2:
+        max_window = max(2, n_selected // 2)
+        ma_window = st.slider("移动平均窗口大小", 2, max(2, max_window),
+                              value=min(3, max_window), key="trend_ma_window")
+        st.caption(f"窗口范围: 2 ~ {max_window} (记录数的一半，向下取整)")
+
+    fig_trend = plot_section_trend(selected_records, section_idx, ma_window)
+    st.pyplot(fig_trend, use_container_width=True)
+
+    st.caption("说明: 实线为原始数据，虚线为移动平均线（MA）。BOD/NH3-N使用左侧Y轴，DO使用右侧Y轴。")
+
+    st.markdown("---")
+    st.subheader("4️⃣ 异常检测")
+    st.caption("采用改进Z-score方法：基于中位数和MAD（中位绝对偏差），超过3倍MAD标记为严重异常，2-3倍MAD为轻度异常。")
+
+    anomaly_result = detect_anomalies(selected_records)
+
+    col_a1, col_a2 = st.columns([1, 1])
+    with col_a1:
+        anomaly_comp = st.selectbox(
+            "选择异常检测组分",
+            ['bod', 'nh3n', 'do'],
+            format_func=lambda x: {'bod': 'BOD', 'nh3n': 'NH3-N', 'do': 'DO'}[x],
+            key="anomaly_comp_select"
+        )
+    with col_a2:
+        st.info(f"共检测到 **{len(anomaly_result['anomaly_details'])}** 个异常点"
+                f"（严重异常: {len([a for a in anomaly_result['anomaly_details'] if a['severity']=='严重异常'])} 个）")
+
+    fig_heatmap = plot_anomaly_heatmap(anomaly_result, anomaly_comp)
+    st.pyplot(fig_heatmap, use_container_width=True)
+
+    st.markdown("#### 📋 异常汇总面板（按异常程度从大到小排序）")
+
+    if anomaly_result['anomaly_details']:
+        anomaly_table = []
+        for a in anomaly_result['anomaly_details']:
+            anomaly_table.append({
+                '严重度': a['severity'],
+                'Z-score': f"{a['z_score']:.2f}",
+                '记录#': a['record_id'],
+                '记录时间': a['record_time'],
+                '断面位置': a['position'],
+                '指标': a['component'],
+                '检测值': f"{a['value']:.3f}",
+                '中位数': f"{a['median']:.3f}",
+                'MAD': f"{a['mad']:.4f}",
+            })
+        df_anomaly = pd.DataFrame(anomaly_table)
+
+        def highlight_severity(row):
+            if row['严重度'] == '严重异常':
+                return ['background-color: #fdedec; color: #c0392b; font-weight: bold'] * len(row)
+            elif row['严重度'] == '轻度异常':
+                return ['background-color: #fef9e7; color: #d68910'] * len(row)
+            return [''] * len(row)
+
+        styled_anomaly = df_anomaly.style.apply(highlight_severity, axis=1)
+        st.dataframe(styled_anomaly, use_container_width=True, hide_index=True, height=300)
+    else:
+        st.success("🎉 未检测到异常点！所有记录的水质指标均在正常范围内。")
+
+    st.markdown("---")
+    st.subheader("5️⃣ 参数敏感性分析")
+    st.caption("计算模拟参数与水质结果之间的Spearman秩相关系数。采用bootstrap(1000次重采样)估计95%置信区间。")
+
+    corr_result = compute_spearman_correlation(selected_records, WATER_QUALITY_STANDARDS)
+
+    if not corr_result:
+        st.warning("⚠️ 记录数量不足，无法进行相关性分析。")
+        return
+
+    fig_corr = plot_correlation_heatmap(corr_result)
+    st.pyplot(fig_corr, use_container_width=True)
+
+    significant_pairs = []
+    all_vars = corr_result['all_vars']
+    var_labels = {
+        'K1': 'K1(BOD衰减)', 'K2': 'K2(复氧)', 'Q_upstream': '上游流量Q',
+        'initial_bod': '上游BOD₀', 'initial_do': '上游DO₀', 'initial_nh3n': '上游NH3-N₀',
+        'avg_bod': '平均BOD', 'min_do': '最低DO', 'max_nh3n': '最高NH3-N',
+        'compliance_rate': '达标率',
+    }
+    for i in range(len(all_vars)):
+        for j in range(i + 1, len(all_vars)):
+            if corr_result['p_matrix'][i, j] < 0.05:
+                significant_pairs.append({
+                    '参数A': var_labels.get(all_vars[i], all_vars[i]),
+                    '参数B': var_labels.get(all_vars[j], all_vars[j]),
+                    '相关系数': f"{corr_result['corr_matrix'][i, j]:.3f}",
+                    'p值': f"{corr_result['p_matrix'][i, j]:.4f}",
+                    '95% CI': f"[{corr_result['ci_low'][i, j]:.3f}, {corr_result['ci_high'][i, j]:.3f}]",
+                    '显著性': '✅ 显著 (p<0.05)',
+                })
+
+    st.markdown("#### 📊 显著相关对 (p < 0.05)")
+    if significant_pairs:
+        df_sig = pd.DataFrame(significant_pairs)
+        st.dataframe(df_sig, use_container_width=True, hide_index=True)
+
+        with st.expander("📈 查看所有相关对的详细置信区间（bootstrap 95% CI）"):
+            all_pairs = []
+            for i in range(len(all_vars)):
+                for j in range(i + 1, len(all_vars)):
+                    sig = '✅' if corr_result['p_matrix'][i, j] < 0.05 else '❌'
+                    all_pairs.append({
+                        '参数对': f"{var_labels.get(all_vars[i], all_vars[i])} ↔ {var_labels.get(all_vars[j], all_vars[j])}",
+                        '相关系数': f"{corr_result['corr_matrix'][i, j]:.3f}",
+                        'p值': f"{corr_result['p_matrix'][i, j]:.4f}",
+                        '95%置信区间': f"[{corr_result['ci_low'][i, j]:.3f}, {corr_result['ci_high'][i, j]:.3f}]",
+                        '显著(p<0.05)': sig,
+                    })
+            st.dataframe(pd.DataFrame(all_pairs), use_container_width=True, hide_index=True, height=400)
+    else:
+        st.info("ℹ️ 未发现显著相关的参数对 (p < 0.05)。这可能是由于参数变化范围较小或记录数量不足。")
 
 
 def warning_emergency_tab():
