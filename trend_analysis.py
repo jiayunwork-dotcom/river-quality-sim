@@ -81,26 +81,45 @@ class SimulationHistory:
 
 
 def moving_average(data: np.ndarray, window: int) -> np.ndarray:
-    """计算移动平均值"""
-    if window <= 1 or len(data) < window:
+    """计算移动平均值（中心窗口，边界处自动扩展/收缩，保证至少2个数据点）"""
+    n = len(data)
+    if window <= 1 or n < 2:
         return np.full_like(data, np.nan)
-    kernel = np.ones(window) / window
-    ma = np.convolve(data, kernel, mode='same')
-    pad_left = window // 2
-    pad_right = window - pad_left - 1
-    for i in range(pad_left):
-        ma[i] = np.mean(data[:i + pad_right + 1])
-    for i in range(len(data) - pad_right, len(data)):
-        ma[i] = np.mean(data[i - pad_left:])
+
+    w = min(window, n)
+    ma = np.zeros(n)
+
+    for i in range(n):
+        half_left = w // 2
+        half_right = (w - 1) // 2
+        left = max(0, i - half_left)
+        right = min(n - 1, i + half_right)
+
+        if right - left + 1 < 2:
+            if left == 0:
+                right = min(n - 1, 1)
+            else:
+                left = max(0, n - 2)
+
+        ma[i] = np.mean(data[left:right + 1])
+
     return ma
 
 
 def modified_z_score(data: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    """计算改进Z-score（基于中位数和MAD）"""
+    """计算改进Z-score（基于中位数和MAD），对MAD=0的情况做稳健处理"""
     median = np.median(data)
-    mad = np.median(np.abs(data - median))
-    if mad == 0:
-        mad = 1e-10
+    abs_dev = np.abs(data - median)
+    mad = np.median(abs_dev)
+
+    eps = 1e-12 * max(abs(median), 1.0)
+    if mad < eps:
+        std = np.std(data, ddof=0)
+        if std < eps:
+            return np.zeros_like(data, dtype=float), median, mad
+        else:
+            mad = 0.6745 * std
+
     mod_z = 0.6745 * (data - median) / mad
     return mod_z, median, mad
 
