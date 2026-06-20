@@ -315,7 +315,7 @@ class RiverSimulation:
 
             if Dx > 0 and u_i > 0 and i > 1:
                 Pe = u_i * dx_i / Dx if Dx > 0 else 1000
-                if Pe < 100:
+                if Pe < 2:
                     diff_bod = Dx * (bod[i - 1] - 2 * bod[i] + bod[i - 2]) / dx_i ** 2
                     bod[i] += diff_bod * dx_i / u_i
                     bod[i] = max(bod[i], 0.0)
@@ -348,12 +348,22 @@ class RiverSimulation:
                                          D_sat, Dx, sources,
                                          nonpoint_bod, nonpoint_nh3n, nonpoint_cod,
                                          initial_conditions):
-        """Crank-Nicolson隐格式求解"""
+        """Crank-Nicolson隐格式求解稳态对流扩散方程
+
+        对流扩散方程: u * dC/dx = Dx * d²C/dx² - K*C + S(x)
+        采用Crank-Nicolson半隐格式逐点递推:
+          - 对流项: 上风差分 (稳定)
+          - 扩散项: C-N半隐格式 (中心差分, i-1用已知值, i+1用上一迭代值)
+          - 衰减项: 半隐式处理 (C^{n+1} 用新值)
+        上游: Dirichlet BC  C[0] = C_in
+        下游: 自然衰减 (零梯度外推)
+        点源通过流量混合法处理
+        """
         n = len(x)
         dx = x[1] - x[0]
 
         bod = np.zeros(n)
-        do = np.zeros(n)
+        do_arr = np.zeros(n)
         nh3n = np.zeros(n)
         cod = np.zeros(n)
 
@@ -373,116 +383,83 @@ class RiverSimulation:
         ]
 
         for comp_name, comp_arr, K_decay, init_val, np_load in components:
-            a_coeff = np.zeros(n)
-            b_coeff = np.zeros(n)
-            c_coeff = np.zeros(n)
-            d = np.zeros(n)
+            comp_arr[0] = init_val
 
-            b_coeff[0] = 1.0
-            d[0] = init_val
-
-            b_coeff[-1] = 1.0
-            d[-1] = init_val
-
-            for i in range(1, n - 1):
-                u_i = V[i]
+            for i in range(1, n):
+                dx_i = x[i] - x[i - 1]
+                u_i = V[i] if V[i] > 1e-10 else 1e-10
                 A_i = A[i] if A[i] > 0 else 1.0
 
-                r = Dx / (dx ** 2) if Dx > 0 else 0
-                c = u_i / (4 * dx) if u_i > 0 else 0
+                Pe = u_i * dx_i / Dx if Dx > 0 else 1000.0
 
-                a_coeff[i] = -r + c
-                b_coeff[i] = 1 + 2 * r + K_decay * dx / (2 * u_i) if u_i > 0 else 1 + K_decay
-                c_coeff[i] = -r - c
+                if Dx > 0 and Pe < 2.0 and i < n - 1:
+                    c_left = Dx / dx_i ** 2
+                    c_right = Dx / dx_i ** 2
+                    c_adv = u_i / dx_i
+                    c_decay = K_decay / 2
 
-                src_term = 0
-                if i in point_source_idx:
-                    for src in point_source_idx[i]:
-                        src_term += src['flow_rate'] * src['concentration'][comp_name] / (A_i * dx)
-                src_term += np_load[i] / A_i if u_i > 0 else 0
+                    denom = c_adv + c_left + c_decay
+                    numer = (c_adv + c_left) * comp_arr[i - 1] + c_right * comp_arr[i + 1] if i + 1 < n else (c_adv + c_left) * comp_arr[i - 1]
 
-                d[i] = init_val + src_term * dx
+                    if np_load[i] > 0:
+                        numer += np_load[i] / A_i
 
-            ab = np.zeros((3, n))
-            ab[0, 1:] = c_coeff[:-1]
-            ab[1, :] = b_coeff
-            ab[2, :-1] = a_coeff[1:]
+                    comp_arr[i] = numer / denom if denom > 0 else comp_arr[i - 1]
+                else:
+                    travel = dx_i / u_i
+                    comp_arr[i] = comp_arr[i - 1] * np.exp(-K_decay * travel)
+                    if np_load[i] > 0:
+                        comp_arr[i] += np_load[i] * dx_i / (A_i * u_i)
 
-            try:
-                solution = solve_banded((1, 1), ab, d)
-                comp_arr[:] = np.maximum(solution, 0.0)
-            except:
-                for i in range(1, n):
-                    u_i = V[i]
-                    comp_arr[i] = comp_arr[i - 1]
-                    if u_i > 0:
-                        travel_time = dx / u_i
-                        comp_arr[i] *= np.exp(-K_decay * travel_time)
-                        comp_arr[i] += np_load[i] * dx / (A[i] * u_i) if A[i] > 0 else 0
-
-            for i in range(1, n):
                 if i in point_source_idx:
                     Q_prev = Q[i - 1]
-                    ps_bod = 0
+                    ps_mass = 0
                     ps_flow = 0
                     for src in point_source_idx[i]:
-                        ps_bod += src['flow_rate'] * src['concentration'][comp_name]
+                        ps_mass += src['flow_rate'] * src['concentration'][comp_name]
                         ps_flow += src['flow_rate']
                     if Q_prev + ps_flow > 0:
-                        comp_arr[i] = (Q_prev * comp_arr[i - 1] + ps_bod) / (Q_prev + ps_flow)
-                        comp_arr[i] = max(comp_arr[i], 0.0)
+                        comp_arr[i] = (Q_prev * comp_arr[i] + ps_mass) / (Q_prev + ps_flow)
 
-        a_coeff = np.zeros(n)
-        b_coeff = np.zeros(n)
-        c_coeff = np.zeros(n)
-        d = np.zeros(n)
+                comp_arr[i] = max(comp_arr[i], 0.0)
 
-        b_coeff[0] = 1.0
-        d[0] = initial_conditions['do']
+            if Dx > 0:
+                for iteration in range(5):
+                    comp_arr_new = comp_arr.copy()
+                    for i in range(1, n - 1):
+                        dx_i = x[i] - x[i - 1]
+                        u_i = V[i] if V[i] > 1e-10 else 1e-10
+                        A_i = A[i] if A[i] > 0 else 1.0
 
-        b_coeff[-1] = 1.0
-        d[-1] = initial_conditions['do']
+                        Pe = u_i * dx_i / Dx if Dx > 0 else 1000.0
+                        if Pe >= 5.0:
+                            continue
 
-        for i in range(1, n - 1):
-            u_i = V[i]
-            A_i = A[i] if A[i] > 0 else 1.0
+                        c_diff = Dx / dx_i ** 2
+                        c_decay = K_decay
+                        weight = min(1.0, 2.0 / (Pe + 1))
 
-            r = Dx / (dx ** 2) if Dx > 0 else 0
-            c = u_i / (4 * dx) if u_i > 0 else 0
+                        cn_val = (c_diff * (comp_arr[i - 1] + comp_arr[i + 1])
+                                  + (1.0 / dx_i - c_decay) * comp_arr[i]
+                                  + np_load[i] / A_i) / (2 * c_diff + 1.0 / dx_i + c_decay)
 
-            a_coeff[i] = -r + c
-            b_coeff[i] = 1 + 2 * r + K2 * dx / (2 * u_i) if u_i > 0 else 1 + K2
-            c_coeff[i] = -r - c
+                        comp_arr_new[i] = (1 - weight) * comp_arr[i] + weight * cn_val
+                        comp_arr_new[i] = max(comp_arr_new[i], 0.0)
 
-            src_do = 0
-            if i in point_source_idx:
-                for src in point_source_idx[i]:
-                    src_do += src['flow_rate'] * src['concentration']['do'] / (A_i * dx)
+                    comp_arr_new[0] = init_val
+                    if n > 1:
+                        comp_arr_new[-1] = comp_arr_new[-2]
+                    comp_arr[:] = comp_arr_new
 
-            d[i] = initial_conditions['do'] + (K2 * D_sat - K1 * bod[i]) * dx / (2 * u_i) if u_i > 0 else initial_conditions['do']
-            d[i] += src_do * dx
-
-        ab = np.zeros((3, n))
-        ab[0, 1:] = c_coeff[:-1]
-        ab[1, :] = b_coeff
-        ab[2, :-1] = a_coeff[1:]
-
-        try:
-            solution = solve_banded((1, 1), ab, d)
-            do[:] = np.clip(solution, 0.0, D_sat)
-        except:
-            for i in range(1, n):
-                u_i = V[i]
-                do[i] = do[i - 1]
-                if u_i > 0:
-                    travel_time = dx / u_i
-                    deficit = D_sat - do[i]
-                    do_change = (K2 * deficit - K1 * bod[i]) * travel_time
-                    do[i] += do_change
-                    do[i] = min(do[i], D_sat)
-                    do[i] = max(do[i], 0.0)
-
+        do_arr[0] = initial_conditions['do']
         for i in range(1, n):
+            dx_i = x[i] - x[i - 1]
+            u_i = V[i] if V[i] > 1e-10 else 1e-10
+            travel = dx_i / u_i
+
+            deficit = D_sat - do_arr[i - 1]
+            do_arr[i] = do_arr[i - 1] + (K2 * deficit - K1 * bod[i]) * travel
+
             if i in point_source_idx:
                 Q_prev = Q[i - 1]
                 ps_do = 0
@@ -491,13 +468,14 @@ class RiverSimulation:
                     ps_do += src['flow_rate'] * src['concentration']['do']
                     ps_flow += src['flow_rate']
                 if Q_prev + ps_flow > 0:
-                    do[i] = (Q_prev * do[i - 1] + ps_do) / (Q_prev + ps_flow)
-                    do[i] = max(do[i], 0.0)
-                    do[i] = min(do[i], D_sat)
+                    do_arr[i] = (Q_prev * do_arr[i] + ps_do) / (Q_prev + ps_flow)
+
+            do_arr[i] = max(do_arr[i], 0.0)
+            do_arr[i] = min(do_arr[i], D_sat)
 
         return {
             'bod': bod,
-            'do': do,
+            'do': do_arr,
             'nh3n': nh3n,
             'cod': cod,
         }

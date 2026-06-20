@@ -874,7 +874,13 @@ def scenario_analysis_tab():
 
         is_baseline = st.checkbox("设为基准情景", value=len(sc_manager.scenarios) == 0, key="sc_baseline")
 
-        if st.button("➕ 添加情景"):
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            add_custom = st.button("➕ 添加自定义情景")
+        with col_btn2:
+            add_current = st.button("📋 添加当前状态为情景")
+
+        if add_custom or add_current:
             scenario = Scenario(
                 name=scenario_name,
                 description=scenario_desc,
@@ -887,15 +893,55 @@ def scenario_analysis_tab():
             scenario.upstream_cod = sc_cod
             scenario.K1 = sc_K1
             scenario.K2 = sc_K2
-            scenario.point_sources = sc_sources
-            scenario.nonpoint_sources = sc_nonpoint_sources
-            scenario.accidental_sources = sc_accidental_sources
-            sc_manager.add_scenario(scenario)
-            st.success(f"情景 '{scenario_name}' 已添加 (含{len(sc_sources)}个点源, {len(sc_nonpoint_sources)}个面源, {len(sc_accidental_sources)}个突发源)")
+
+            if add_current:
+                current_ps = []
+                for ps in sim.source_manager.get_point_sources():
+                    current_ps.append({
+                        'name': ps.name, 'x': ps.x, 'flow_rate': ps.flow_rate,
+                        'bod': ps.bod_conc, 'do': ps.do_conc,
+                        'nh3n': ps.nh3n_conc, 'cod': ps.cod_conc
+                    })
+                current_nps = []
+                for nps in sim.source_manager.get_nonpoint_sources():
+                    current_nps.append({
+                        'name': nps.name, 'start_x': nps.start_x, 'end_x': nps.end_x,
+                        'area': nps.area,
+                        'bod_load': nps.bod_load, 'nh3n_load': nps.nh3n_load,
+                        'cod_load': nps.cod_load
+                    })
+                current_acc = []
+                for acc in sim.source_manager.get_accidental_sources():
+                    current_acc.append({
+                        'name': acc.name, 'x': acc.x,
+                        'release_type': 'continuous' if acc.release_type == ReleaseType.CONTINUOUS else 'instantaneous',
+                        'total_mass_bod': acc.total_mass_bod,
+                        'total_mass_nh3n': acc.total_mass_nh3n,
+                        'total_mass_cod': acc.total_mass_cod,
+                        'release_duration': acc.release_duration,
+                        'flow_rate': acc.flow_rate
+                    })
+                scenario.point_sources = current_ps
+                scenario.nonpoint_sources = current_nps
+                scenario.accidental_sources = current_acc
+                src_info = f"{len(current_ps)}个点源, {len(current_nps)}个面源, {len(current_acc)}个突发源"
+                sc_manager.add_scenario(scenario)
+                st.success(f"情景 '{scenario_name}' 已添加（从侧边栏同步: {src_info}）")
+            else:
+                scenario.point_sources = sc_sources
+                scenario.nonpoint_sources = sc_nonpoint_sources
+                scenario.accidental_sources = sc_accidental_sources
+                sc_manager.add_scenario(scenario)
+                st.success(f"情景 '{scenario_name}' 已添加 (含{len(sc_sources)}个点源, {len(sc_nonpoint_sources)}个面源, {len(sc_accidental_sources)}个突发源)")
 
         scenario_names = sc_manager.get_scenario_names()
         if scenario_names:
-            selected = st.selectbox("选择情景", scenario_names, key="sc_select")
+            for s in sc_manager.scenarios:
+                src_count = f"{len(s.point_sources)}点源/{len(s.nonpoint_sources)}面源/{len(s.accidental_sources)}突发源"
+                baseline_tag = " [基准]" if s.is_baseline else ""
+                st.markdown(f"**{s.name}**{baseline_tag} — K1={s.K1:.2f}, K2={s.K2:.2f}, Q={s.upstream_flow:.1f}m³/s, {src_count}")
+
+            selected = st.selectbox("选择要删除的情景", scenario_names, key="sc_select")
             if st.button("❌ 删除选中情景"):
                 sc_manager.remove_scenario(selected)
                 st.rerun()
