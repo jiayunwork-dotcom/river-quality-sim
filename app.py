@@ -22,7 +22,10 @@ from scenario_analysis import Scenario, ScenarioManager
 from report_generator import ReportGenerator
 from trend_analysis import (
     SimulationHistory, moving_average, detect_anomalies,
-    compute_spearman_correlation, compute_summary_stats
+    compute_spearman_correlation, compute_summary_stats,
+    analyze_anomaly_cause, TrendWarningRules,
+    MonotonicTrendRule, SlopeWarningRule, VolatilityWarningRule,
+    PARAM_LABEL_MAP
 )
 from warning_module import (
     WarningThreshold, WarningRules, EmergencyMeasure,
@@ -324,6 +327,12 @@ def init_session_state():
 
     if 'trend_selected_ids' not in st.session_state:
         st.session_state.trend_selected_ids = []
+
+    if 'trend_warning_rules' not in st.session_state:
+        st.session_state.trend_warning_rules = TrendWarningRules()
+
+    if 'anomaly_cause_selected' not in st.session_state:
+        st.session_state.anomaly_cause_selected = None
 
 
 def plot_water_quality_profile(result, components=None):
@@ -1743,59 +1752,251 @@ def trend_analysis_tab():
     st.caption("本模块对多次稳态模拟的历史结果进行统计分析和异常识别。请先在【稳态模拟】Tab中运行至少3次模拟。")
 
     history = st.session_state.simulation_history
+    trend_rules = st.session_state.trend_warning_rules
+
+    triggered_warnings = []
+    selected_records_pre = []
+
+    if not history.is_empty():
+        selected_records_pre = [r for r in history.records if r.record_id in st.session_state.trend_selected_ids]
+        if len(selected_records_pre) >= 3:
+            triggered_warnings = trend_rules.check_all(selected_records_pre)
+
+    rule_id_to_rule = {r.rule_id: r for r in trend_rules.rules}
+
+    if triggered_warnings:
+        st.markdown("### ⚠️ 趋势预警")
+        warning_cols = st.columns(min(3, len(triggered_warnings)))
+        for i, warning in enumerate(triggered_warnings):
+            with warning_cols[i % 3]:
+                rule_type_label = {
+                    'monotonic': '📈 单调趋势预警',
+                    'slope': '📐 斜率预警',
+                    'volatility': '🌊 波动预警'
+                }[warning['rule_type']]
+                comp_label = {'bod': 'BOD', 'nh3n': 'NH3-N', 'do': 'DO'}[warning['component']]
+                pos_label = f"x = {selected_records_pre[0].x[warning['section_idx']]:.0f}m"
+
+                extra_info = ""
+                rule = rule_id_to_rule.get(warning['rule_id'])
+                if warning['rule_type'] == 'monotonic':
+                    extra_info = f"方向: {warning['direction']} | 连续{len(warning['values'])}条"
+                elif warning['rule_type'] == 'slope' and rule:
+                    extra_info = f"斜率: {warning['slope']:.4f} | 阈值: {rule.slope_threshold}"
+                elif warning['rule_type'] == 'volatility' and rule:
+                    extra_info = f"CV: {warning['cv']:.3f} | 阈值: {rule.cv_threshold}"
+
+                st.markdown(
+                    f"<div style='padding:14px; border-radius:10px; "
+                    f"background:linear-gradient(135deg,#fff3cd,#ffeaa7); "
+                    f"border:2px solid #f39c12; margin-bottom:8px;'>"
+                    f"<div style='font-weight:bold;color:#d68910;font-size:14px;'>"
+                    f"⚠️ {rule_type_label} - {warning['rule_name']}</div>"
+                    f"<div style='font-size:12px;color:#7d6608;margin-top:6px;'>"
+                    f"断面: {pos_label} | 指标: {comp_label}</div>"
+                    f"<div style='font-size:12px;color:#7d6608;margin-top:2px;'>"
+                    f"{warning['message']}</div>"
+                    f"<div style='font-size:11px;color:#9a7b08;margin-top:4px;'>"
+                    f"记录 #{warning['start_record']} ~ #{warning['end_record']} | {extra_info}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
 
     st.markdown("---")
-    st.subheader("1️⃣ 模拟历史管理")
+    st.subheader("1️⃣ 模拟历史管理 & 趋势预警规则配置")
+
+    col_mgmt_left, col_mgmt_right = st.columns([2, 3])
+
+    with col_mgmt_left:
+        st.markdown("#### 📋 模拟历史选择")
 
     if history.is_empty():
         st.warning("⚠️ 暂无模拟历史记录，请先在【稳态模拟】Tab页运行模拟。每次运行稳态模拟后，结果将自动保存到历史队列（最多50条）。")
         return
 
-    col_hdr1, col_hdr2, col_hdr3 = st.columns([3, 1, 1])
-    with col_hdr1:
-        st.info(f"📋 当前共有 **{len(history)}** 条历史记录（最多保留50条）")
-    with col_hdr2:
-        select_all = st.button("✅ 全选", use_container_width=True)
-    with col_hdr3:
-        clear_sel = st.button("⬜ 取消全选", use_container_width=True)
+    with col_mgmt_left:
+        col_hdr1, col_hdr2, col_hdr3 = st.columns([3, 1, 1])
+        with col_hdr1:
+            st.info(f"📋 当前共有 **{len(history)}** 条历史记录（最多保留50条）")
+        with col_hdr2:
+            select_all = st.button("✅ 全选", use_container_width=True)
+        with col_hdr3:
+            clear_sel = st.button("⬜ 取消全选", use_container_width=True)
 
-    history_df_data = []
-    for idx, rec in enumerate(history.records):
-        history_df_data.append({
-            '编号': rec.record_id,
-            '时间': rec.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            '参数摘要': rec.param_summary(),
-            '达标率(%)': f"{rec.get_compliance_rate(WATER_QUALITY_STANDARDS):.1f}",
-        })
-    df_history = pd.DataFrame(history_df_data)
+        all_ids = [rec.record_id for rec in history.records]
 
-    all_ids = [rec.record_id for rec in history.records]
+        if select_all:
+            st.session_state.trend_selected_ids = all_ids.copy()
+        if clear_sel:
+            st.session_state.trend_selected_ids = []
 
-    if select_all:
-        st.session_state.trend_selected_ids = all_ids.copy()
-    if clear_sel:
-        st.session_state.trend_selected_ids = []
+        with st.expander("📋 选择模拟记录", expanded=True):
+            selected = []
+            cols_per_row = 2
+            rows = [history.records[i:i + cols_per_row] for i in range(0, len(history.records), cols_per_row)]
+            for row in rows:
+                cols = st.columns(cols_per_row)
+                for col, rec in zip(cols, row):
+                    with col:
+                        default_checked = rec.record_id in st.session_state.trend_selected_ids
+                        is_checked = st.checkbox(
+                            f"#{rec.record_id} | {rec.timestamp.strftime('%H:%M:%S')}",
+                            value=default_checked,
+                            key=f"hist_check_{rec.record_id}"
+                        )
+                        st.caption(rec.param_summary())
+                        st.caption(f"达标率: {rec.get_compliance_rate(WATER_QUALITY_STANDARDS):.1f}%")
+                        if is_checked:
+                            selected.append(rec.record_id)
 
-    with st.expander("📋 查看并选择模拟记录（勾选参与分析的记录）", expanded=True):
-        selected = []
-        cols_per_row = 4
-        rows = [history.records[i:i + cols_per_row] for i in range(0, len(history.records), cols_per_row)]
-        for row in rows:
-            cols = st.columns(cols_per_row)
-            for col, rec in zip(cols, row):
-                with col:
-                    default_checked = rec.record_id in st.session_state.trend_selected_ids
-                    is_checked = st.checkbox(
-                        f"#{rec.record_id} | {rec.timestamp.strftime('%H:%M:%S')}",
-                        value=default_checked,
-                        key=f"hist_check_{rec.record_id}"
+            st.session_state.trend_selected_ids = selected
+
+    with col_mgmt_right:
+        st.markdown("#### 🎛️ 趋势预警规则配置")
+        st.caption("配置统计趋势预警规则（非水质阈值预警），支持单调趋势、斜率预警和波动预警三种类型。")
+
+        positions = history.records[0].x
+        position_labels = [f"x = {p:.0f}m" for p in positions]
+        if len(positions) > 30:
+            step = max(1, len(positions) // 30)
+            display_indices = list(range(0, len(positions), step))
+        else:
+            display_indices = list(range(len(positions)))
+
+        col_add1, col_add2, col_add3, col_add4 = st.columns(4)
+        with col_add1:
+            new_rule_type = st.selectbox(
+                "规则类型",
+                ['monotonic', 'slope', 'volatility'],
+                format_func=lambda x: {
+                    'monotonic': '📈 单调趋势',
+                    'slope': '📐 斜率预警',
+                    'volatility': '🌊 波动预警'
+                }[x],
+                key="new_rule_type"
+            )
+        with col_add2:
+            display_labels = [position_labels[i] for i in display_indices]
+            new_rule_section_label = st.selectbox(
+                "断面位置", display_labels, key="new_rule_section"
+            )
+            new_rule_section_idx = display_indices[display_labels.index(new_rule_section_label)]
+        with col_add3:
+            new_rule_comp = st.selectbox(
+                "指标",
+                ['bod', 'nh3n', 'do'],
+                format_func=lambda x: {'bod': 'BOD', 'nh3n': 'NH3-N', 'do': 'DO'}[x],
+                key="new_rule_comp"
+            )
+        with col_add4:
+            new_rule_name = st.text_input("规则名称", value=f"规则{trend_rules._next_id}", key="new_rule_name")
+
+        col_params1, col_params2, col_params3, col_add_btn = st.columns([1, 1, 1, 1])
+        if new_rule_type == 'monotonic':
+            with col_params1:
+                consecutive_count = st.slider("连续记录数", 3, 10, 5, key="mono_count")
+            with col_params2:
+                st.caption("连续N条记录呈单调上升或下降则触发")
+        elif new_rule_type == 'slope':
+            with col_params1:
+                slope_window = st.slider("窗口大小", 3, min(10, len(history.records)), 5, key="slope_window")
+            with col_params2:
+                slope_threshold = st.number_input("斜率阈值", 0.001, 1.0, 0.1, 0.001, format="%.3f", key="slope_thresh")
+        else:
+            with col_params1:
+                vol_window = st.slider("窗口大小", 3, min(10, len(history.records)), 5, key="vol_window")
+            with col_params2:
+                cv_threshold = st.number_input("CV阈值", 0.01, 1.0, 0.1, 0.01, format="%.2f", key="cv_thresh")
+
+        with col_add_btn:
+            add_rule_btn = st.button("➕ 添加规则", type="primary", use_container_width=True)
+            if add_rule_btn:
+                if new_rule_type == 'monotonic':
+                    rule = MonotonicTrendRule(
+                        rule_type='monotonic',
+                        section_idx=new_rule_section_idx,
+                        component=new_rule_comp,
+                        consecutive_count=consecutive_count,
+                        rule_name=new_rule_name,
                     )
-                    st.caption(rec.param_summary())
-                    st.caption(f"达标率: {rec.get_compliance_rate(WATER_QUALITY_STANDARDS):.1f}%")
-                    if is_checked:
-                        selected.append(rec.record_id)
+                elif new_rule_type == 'slope':
+                    rule = SlopeWarningRule(
+                        rule_type='slope',
+                        section_idx=new_rule_section_idx,
+                        component=new_rule_comp,
+                        window_size=slope_window,
+                        slope_threshold=slope_threshold,
+                        rule_name=new_rule_name,
+                    )
+                else:
+                    rule = VolatilityWarningRule(
+                        rule_type='volatility',
+                        section_idx=new_rule_section_idx,
+                        component=new_rule_comp,
+                        window_size=vol_window,
+                        cv_threshold=cv_threshold,
+                        rule_name=new_rule_name,
+                    )
+                trend_rules.add_rule(rule)
+                st.success(f"✅ 已添加规则: {new_rule_name}")
+                st.rerun()
 
-        st.session_state.trend_selected_ids = selected
+        if trend_rules.rules:
+            st.markdown("##### 📋 已配置规则")
+            triggered_rule_ids = {w['rule_id'] for w in triggered_warnings}
+            rule_table_data = []
+            for rule in trend_rules.rules:
+                comp_label = {'bod': 'BOD', 'nh3n': 'NH3-N', 'do': 'DO'}[rule.component]
+                pos_label = f"x = {positions[rule.section_idx]:.0f}m"
+                type_label = {'monotonic': '单调趋势', 'slope': '斜率预警', 'volatility': '波动预警'}[rule.rule_type]
+
+                if rule.rule_type == 'monotonic':
+                    param_desc = f"连续{rule.consecutive_count}条"
+                elif rule.rule_type == 'slope':
+                    param_desc = f"窗口={rule.window_size}, 阈值={rule.slope_threshold}"
+                else:
+                    param_desc = f"窗口={rule.window_size}, CV阈值={rule.cv_threshold}"
+
+                is_triggered = rule.rule_id in triggered_rule_ids
+                status = "⚠️ 触发" if is_triggered else "✅ 正常"
+
+                rule_table_data.append({
+                    'ID': rule.rule_id,
+                    '名称': rule.rule_name,
+                    '类型': type_label,
+                    '断面': pos_label,
+                    '指标': comp_label,
+                    '参数': param_desc,
+                    '状态': status,
+                })
+
+            df_rules = pd.DataFrame(rule_table_data)
+
+            def highlight_triggered(row):
+                if '触发' in row['状态']:
+                    return ['background-color: #fff3cd; color: #d68910; font-weight: bold'] * len(row)
+                return [''] * len(row)
+
+            styled_rules = df_rules.style.apply(highlight_triggered, axis=1)
+            st.dataframe(styled_rules, use_container_width=True, hide_index=True, height=200)
+
+            col_remove1, col_remove2 = st.columns([1, 1])
+            with col_remove1:
+                rule_to_remove = st.selectbox(
+                    "选择要删除的规则ID",
+                    [r.rule_id for r in trend_rules.rules],
+                    key="rule_to_remove"
+                )
+            with col_remove2:
+                if st.button("🗑️ 删除选中规则", use_container_width=True):
+                    trend_rules.remove_rule(rule_to_remove)
+                    st.rerun()
+
+            if st.button("🗑️ 清空所有规则", use_container_width=True):
+                trend_rules.clear()
+                st.rerun()
+        else:
+            st.info("ℹ️ 暂无配置的预警规则，请上方添加规则")
 
     selected_records = [r for r in history.records if r.record_id in st.session_state.trend_selected_ids]
     n_selected = len(selected_records)
@@ -1893,8 +2094,8 @@ def trend_analysis_tab():
     st.caption("说明: 实线为原始数据，虚线为移动平均线（MA）。BOD/NH3-N使用左侧Y轴，DO使用右侧Y轴。")
 
     st.markdown("---")
-    st.subheader("4️⃣ 异常检测")
-    st.caption("采用改进Z-score方法：基于中位数和MAD（中位绝对偏差），超过3倍MAD标记为严重异常，2-3倍MAD为轻度异常。")
+    st.subheader("4️⃣ 异常检测 & 溯因分析")
+    st.caption("采用改进Z-score方法：基于中位数和MAD（中位绝对偏差），超过3倍MAD标记为严重异常，2-3倍MAD为轻度异常。点击下方选择器可分析异常成因。")
 
     anomaly_result = detect_anomalies(selected_records)
 
@@ -1913,9 +2114,113 @@ def trend_analysis_tab():
     fig_heatmap = plot_anomaly_heatmap(anomaly_result, anomaly_comp)
     st.pyplot(fig_heatmap, use_container_width=True)
 
-    st.markdown("#### 📋 异常汇总面板（按异常程度从大到小排序）")
-
     if anomaly_result['anomaly_details']:
+        st.markdown("#### 🔍 异常溯因分析")
+        st.caption("选择一个异常单元格（记录+断面），系统将自动分析可能的成因并定位上游污染源。")
+
+        matrix = anomaly_result['anomaly_matrix'][anomaly_comp]
+        positions = anomaly_result['positions']
+
+        anomalous_cells = []
+        for r_idx in range(matrix.shape[0]):
+            for p_idx in range(matrix.shape[1]):
+                if matrix[r_idx, p_idx] > 0:
+                    severity = "严重异常" if matrix[r_idx, p_idx] > 1 else "轻度异常"
+                    record = selected_records[r_idx]
+                    anomalous_cells.append({
+                        'record_idx': r_idx,
+                        'record_id': record.record_id,
+                        'position_idx': p_idx,
+                        'position': positions[p_idx],
+                        'severity': severity,
+                        'label': f"记录#{record.record_id} | 断面{positions[p_idx]:.0f}m | {severity}"
+                    })
+
+        if anomalous_cells:
+            col_sel1, col_sel2, col_sel3 = st.columns([3, 1, 1])
+            with col_sel1:
+                selected_anomaly_label = st.selectbox(
+                    "选择要分析的异常单元格",
+                    [c['label'] for c in anomalous_cells],
+                    key="anomaly_select"
+                )
+            selected_cell = anomalous_cells[[c['label'] for c in anomalous_cells].index(selected_anomaly_label)]
+
+            with col_sel2:
+                analyze_btn = st.button("🔍 分析成因", type="primary", use_container_width=True)
+            with col_sel3:
+                close_analysis = st.button("⬜ 关闭分析", use_container_width=True)
+
+            if close_analysis:
+                st.session_state.anomaly_cause_selected = None
+
+            if analyze_btn or st.session_state.anomaly_cause_selected is not None:
+                if analyze_btn:
+                    st.session_state.anomaly_cause_selected = selected_cell
+
+                cell = st.session_state.anomaly_cause_selected
+                if cell is not None:
+                    anomaly_record = selected_records[cell['record_idx']]
+                    position_idx = cell['position_idx']
+
+                    sim = st.session_state.simulation
+                    point_sources = sim.source_manager.get_point_sources()
+
+                    cause_result = analyze_anomaly_cause(
+                        anomaly_record=anomaly_record,
+                        all_records=selected_records,
+                        position_idx=position_idx,
+                        component=anomaly_comp,
+                        point_sources=point_sources
+                    )
+
+                    with st.expander(f"📊 异常成因分析 - 记录#{cell['record_id']} | 断面{cell['position']:.0f}m | {cause_result.get('component', '')}", expanded=True):
+                        if cause_result.get('in_impact_range'):
+                            st.warning(
+                                f"⚠️ **高亮提示**：该异常位于排污口「{cause_result['impact_source_name']}」影响范围内（下游1000m以内）！"
+                            )
+
+                        if cause_result.get('nearest_upstream_source'):
+                            src = cause_result['nearest_upstream_source']
+                            distance = cause_result['position_x'] - src.x
+                            st.info(
+                                f"📍 **上游最近污染源**：排污口「{src.name}」位于 x={src.x:.0f}m 处，"
+                                f"距离该异常断面 {distance:.0f}m (上游方向)"
+                            )
+
+                        if cause_result.get('top_causes'):
+                            st.markdown("#### 🎯 可能成因分析（按参数偏差程度排序）")
+                            for i, cause in enumerate(cause_result['top_causes']):
+                                st.markdown(f"**{i+1}.** {cause}")
+
+                        if cause_result.get('param_deviations'):
+                            st.markdown("#### 📋 参数偏差详情")
+                            dev_table = []
+                            for pd in cause_result['param_deviations']:
+                                dev_table.append({
+                                    '参数名称': pd['param_label'],
+                                    '异常值': f"{pd['anomaly_value']:.4f}",
+                                    '正常中位数': f"{pd['normal_median']:.4f}",
+                                    '偏差方向': pd['direction'],
+                                    '偏差百分比': f"{pd['deviation_percent']:+.1f}%",
+                                    '标准化偏差': f"{pd['standardized_deviation']:.2f}"
+                                })
+                            df_dev = pd.DataFrame(dev_table)
+
+                            def highlight_deviation(row):
+                                dev_val = float(row['标准化偏差'])
+                                if dev_val > 2.5:
+                                    return ['background-color: #fdedec; color: #c0392b; font-weight: bold'] * len(row)
+                                elif dev_val > 1.5:
+                                    return ['background-color: #fef9e7; color: #d68910'] * len(row)
+                                return [''] * len(row)
+
+                            styled_dev = df_dev.style.apply(highlight_deviation, axis=1)
+                            st.dataframe(styled_dev, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("ℹ️ 未找到足够的正常记录进行参数对比分析。")
+
+        st.markdown("#### 📋 异常汇总面板（按异常程度从大到小排序）")
         anomaly_table = []
         for a in anomaly_result['anomaly_details']:
             anomaly_table.append({
