@@ -37,6 +37,205 @@ WATER_QUALITY_STANDARDS = {
     'cod': 20.0,
 }
 
+STANDARD_NAMES = {
+    'bod': 'BOD',
+    'do': 'DO',
+    'nh3n': 'NH3-N',
+    'cod': 'COD',
+}
+
+
+def compute_compliance_at_point(bod_val, do_val, nh3n_val):
+    """计算单个点的三项指标是否全部达标"""
+    bod_ok = bod_val <= WATER_QUALITY_STANDARDS['bod']
+    do_ok = do_val >= WATER_QUALITY_STANDARDS['do']
+    nh3n_ok = nh3n_val <= WATER_QUALITY_STANDARDS['nh3n']
+    return bod_ok and do_ok and nh3n_ok
+
+
+def compute_compliance_array(result):
+    """计算所有网格点的达标状态数组"""
+    x = result['x']
+    n = len(x)
+    compliance = np.zeros(n, dtype=bool)
+    for i in range(n):
+        compliance[i] = compute_compliance_at_point(
+            result['bod'][i], result['do'][i], result['nh3n'][i]
+        )
+    return compliance
+
+
+def compute_sliding_compliance_rate(result, window=500.0):
+    """计算滑动窗口达标率曲线
+
+    以当前断面为中心，前后各取window米范围内的所有网格点，
+    统计这些点中三项指标全部达标的比例。
+    """
+    x = result['x']
+    n = len(x)
+    compliance = compute_compliance_array(result)
+    rates = np.zeros(n)
+
+    for i in range(n):
+        x_center = x[i]
+        mask = (x >= x_center - window) & (x <= x_center + window)
+        window_points = compliance[mask]
+        if len(window_points) > 0:
+            rates[i] = np.sum(window_points) / len(window_points) * 100
+        else:
+            rates[i] = 100.0
+
+    return x, rates
+
+
+def find_threshold_crossings(x, rates, down_threshold=60.0, up_threshold=80.0):
+    """找到达标率首次跌破阈值和首次回升到阈值的位置"""
+    first_below = None
+    first_above = None
+
+    below_started = False
+    for i in range(1, len(rates)):
+        if rates[i - 1] >= down_threshold and rates[i] < down_threshold and first_below is None:
+            first_below = (x[i], rates[i])
+            below_started = True
+        if below_started and rates[i - 1] < up_threshold and rates[i] >= up_threshold and first_above is None:
+            first_above = (x[i], rates[i])
+            break
+
+    return first_below, first_above
+
+
+def plot_compliance_curve(x, rates, first_below=None, first_above=None):
+    """绘制达标率沿程变化曲线"""
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.plot(x, rates, color='#27ae60', linewidth=2.5, label='达标率')
+    ax.fill_between(x, rates, 0, color='#27ae60', alpha=0.15)
+
+    ax.axhline(y=60, color='#e67e22', linestyle='--', alpha=0.8, linewidth=1.5, label='60%警戒线')
+    ax.axhline(y=80, color='#2980b9', linestyle='--', alpha=0.8, linewidth=1.5, label='80%达标线')
+
+    if first_below is not None:
+        ax.scatter([first_below[0]], [first_below[1]], color='#e74c3c', s=120, zorder=5,
+                   edgecolor='black', linewidth=1.5)
+        ax.annotate(f"首次跌破60%\nx={first_below[0]:.0f}m, {first_below[1]:.1f}%",
+                    xy=(first_below[0], first_below[1]),
+                    xytext=(first_below[0] + 300, first_below[1] - 15),
+                    fontsize=9,
+                    arrowprops=dict(arrowstyle='->', color='#c0392b', lw=1.5),
+                    bbox=dict(boxstyle='round,pad=0.4', facecolor='#fdecea', edgecolor='#e74c3c'))
+
+    if first_above is not None:
+        ax.scatter([first_above[0]], [first_above[1]], color='#16a085', s=120, zorder=5,
+                   edgecolor='black', linewidth=1.5)
+        ax.annotate(f"首次回升到80%\nx={first_above[0]:.0f}m, {first_above[1]:.1f}%",
+                    xy=(first_above[0], first_above[1]),
+                    xytext=(first_above[0] + 300, first_above[1] + 8),
+                    fontsize=9,
+                    arrowprops=dict(arrowstyle='->', color='#138d75', lw=1.5),
+                    bbox=dict(boxstyle='round,pad=0.4', facecolor='#e8f8f5', edgecolor='#16a085'))
+
+    ax.set_xlabel('河流距离 (m)', fontsize=11)
+    ax.set_ylabel('达标率 (%)', fontsize=11)
+    ax.set_title('达标率沿程变化曲线 (±500m滑动窗口)', fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 105)
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3, linestyle=':')
+
+    return fig
+
+
+def generate_compliance_summary(result):
+    """生成水质达标评估摘要数据"""
+    x = result['x']
+    total_length = x[-1] - x[0]
+
+    x_rates, rates = compute_sliding_compliance_rate(result)
+    avg_rate = np.mean(rates)
+
+    compliance = compute_compliance_array(result)
+    non_compliance_mask = ~compliance
+
+    worst_idx = None
+    worst_score = float('inf')
+    for i in range(len(x)):
+        score = 0
+        if result['bod'][i] > WATER_QUALITY_STANDARDS['bod']:
+            score += (result['bod'][i] / WATER_QUALITY_STANDARDS['bod'] - 1) * 100
+        if result['do'][i] < WATER_QUALITY_STANDARDS['do']:
+            score += (WATER_QUALITY_STANDARDS['do'] / result['do'][i] - 1) * 100 if result['do'][i] > 0 else 1000
+        if result['nh3n'][i] > WATER_QUALITY_STANDARDS['nh3n']:
+            score += (result['nh3n'][i] / WATER_QUALITY_STANDARDS['nh3n'] - 1) * 100
+        if score > 0 and score < worst_score:
+            worst_score = score
+            worst_idx = i
+
+    worst_x = x[worst_idx] if worst_idx is not None else x[0]
+    worst_items = []
+    if worst_idx is not None:
+        if result['bod'][worst_idx] > WATER_QUALITY_STANDARDS['bod']:
+            worst_items.append('BOD')
+        if result['do'][worst_idx] < WATER_QUALITY_STANDARDS['do']:
+            worst_items.append('DO')
+        if result['nh3n'][worst_idx] > WATER_QUALITY_STANDARDS['nh3n']:
+            worst_items.append('NH3-N')
+
+    if not worst_items:
+        worst_items = ['无']
+
+    exceed_segments_length = 0.0
+    if np.any(non_compliance_mask):
+        dx = x[1] - x[0]
+        exceed_segments_length = np.sum(non_compliance_mask) * dx
+
+    exceed_ratio = exceed_segments_length / total_length * 100 if total_length > 0 else 0
+
+    bod_exceed_total = np.sum(result['bod'] > WATER_QUALITY_STANDARDS['bod'])
+    do_below_total = np.sum(result['do'] < WATER_QUALITY_STANDARDS['do'])
+    nh3n_exceed_total = np.sum(result['nh3n'] > WATER_QUALITY_STANDARDS['nh3n'])
+
+    most_severe_comp = 'BOD'
+    most_severe_pct = 0
+    if bod_exceed_total > 0:
+        max_excess = (np.max(result['bod']) / WATER_QUALITY_STANDARDS['bod'] - 1) * 100
+        most_severe_pct = max_excess
+    if do_below_total > 0:
+        min_do = np.min(result['do'])
+        excess = (WATER_QUALITY_STANDARDS['do'] / min_do - 1) * 100 if min_do > 0 else 999
+        if excess > most_severe_pct:
+            most_severe_pct = excess
+            most_severe_comp = 'DO'
+    if nh3n_exceed_total > 0:
+        max_excess = (np.max(result['nh3n']) / WATER_QUALITY_STANDARDS['nh3n'] - 1) * 100
+        if max_excess > most_severe_pct:
+            most_severe_pct = max_excess
+            most_severe_comp = 'NH3-N'
+
+    non_comp_indices = np.where(non_compliance_mask)[0]
+    start_seg = end_seg = '-'
+    if len(non_comp_indices) > 0:
+        start_seg = f"{x[non_comp_indices[0]]:.0f}m"
+        end_seg = f"{x[non_comp_indices[-1]]:.0f}m"
+
+    if most_severe_pct == 0:
+        conclusion = "该河段水质整体满足地表水III类标准，水环境质量良好。"
+    else:
+        conclusion = (f"该河段{most_severe_comp}超标严重（最大超标{most_severe_pct:.1f}%），"
+                      f"建议重点治理{start_seg}至{end_seg}段。")
+
+    return {
+        'avg_compliance_rate': avg_rate,
+        'worst_position': worst_x,
+        'worst_items': worst_items,
+        'exceed_length_ratio': exceed_ratio,
+        'exceed_length': exceed_segments_length,
+        'conclusion': conclusion,
+        'most_severe_comp': most_severe_comp,
+        'most_severe_pct': most_severe_pct,
+        'start_seg': start_seg,
+        'end_seg': end_seg,
+    }
+
 
 def init_session_state():
     """初始化会话状态"""
@@ -210,6 +409,55 @@ def plot_scenario_comparison(results, component='bod'):
     ax.set_title(f'多情景对比 - {name_map.get(component, component)}沿程分布')
     ax.legend()
     ax.grid(True, alpha=0.3)
+
+    return fig
+
+
+def plot_scenario_compliance_comparison(results, scenario_manager=None):
+    """绘制多情景达标率对比图"""
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    colors = ['#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#e67e22']
+    solid_linestyles = ['-', '--', ':', '-.']
+
+    baseline_names = set()
+    if scenario_manager is not None:
+        for s in scenario_manager.scenarios:
+            if s.is_baseline:
+                baseline_names.add(s.name)
+
+    for i, result in enumerate(results):
+        color = colors[i % len(colors)]
+        x_rates, rates = compute_sliding_compliance_rate(result)
+
+        scenario_name = result.get('scenario_name', f'情景{i+1}')
+        is_baseline = scenario_name in baseline_names
+
+        if is_baseline:
+            linestyle = '-'
+            linewidth = 3
+            label = f"{scenario_name} (基准) — 实线"
+        else:
+            linestyle = solid_linestyles[(i % (len(solid_linestyles) - 1)) + 1]
+            linewidth = 2.2
+            style_tag = {'--': '虚线', ':': '点线', '-.': '点划线'}
+            label = f"{scenario_name} — {style_tag.get(linestyle, '对比线')}"
+
+        ax.plot(x_rates, rates, color=color, linestyle=linestyle,
+                linewidth=linewidth, label=label, alpha=0.9)
+
+    ax.axhline(y=60, color='#e67e22', linestyle='--', alpha=0.6, linewidth=1.2, label='60%警戒线')
+    ax.axhline(y=80, color='#2980b9', linestyle='--', alpha=0.6, linewidth=1.2, label='80%达标线')
+    ax.fill_between(x_rates, 0, 60, color='#e74c3c', alpha=0.05)
+    ax.fill_between(x_rates, 60, 80, color='#f39c12', alpha=0.05)
+    ax.fill_between(x_rates, 80, 100, color='#27ae60', alpha=0.05)
+
+    ax.set_xlabel('河流距离 (m)', fontsize=11)
+    ax.set_ylabel('达标率 (%)', fontsize=11)
+    ax.set_title('多情景达标率沿程对比 (±500m滑动窗口)', fontsize=13, fontweight='bold')
+    ax.set_ylim(0, 105)
+    ax.legend(loc='best', fontsize=8.5, framealpha=0.95)
+    ax.grid(True, alpha=0.3, linestyle=':')
 
     return fig
 
@@ -481,6 +729,89 @@ def steady_simulation_tab():
         st.subheader("📈 沿程水质分布")
         fig_profile = plot_water_quality_profile(result)
         st.pyplot(fig_profile, use_container_width=True)
+
+        with st.expander("✅ 达标分析", expanded=True):
+            st.markdown("**地表水III类标准：** DO ≥ 5mg/L | BOD ≤ 4mg/L | NH3-N ≤ 1mg/L")
+            x = result['x']
+            step = max(1, len(x) // 20)
+            sample_indices = list(range(0, len(x), step))
+            if sample_indices[-1] != len(x) - 1:
+                sample_indices.append(len(x) - 1)
+
+            table_data = []
+            for idx in sample_indices:
+                xi = x[idx]
+                bod_val = result['bod'][idx]
+                do_val = result['do'][idx]
+                nh3n_val = result['nh3n'][idx]
+
+                bod_ok = bod_val <= WATER_QUALITY_STANDARDS['bod']
+                do_ok = do_val >= WATER_QUALITY_STANDARDS['do']
+                nh3n_ok = nh3n_val <= WATER_QUALITY_STANDARDS['nh3n']
+                all_ok = bod_ok and do_ok and nh3n_ok
+
+                if bod_ok:
+                    bod_str = f"{bod_val:.2f}"
+                else:
+                    excess = (bod_val / WATER_QUALITY_STANDARDS['bod'] - 1) * 100
+                    bod_str = f"{bod_val:.2f} 🔴(+{excess:.1f}%)"
+
+                if do_ok:
+                    do_str = f"{do_val:.2f}"
+                else:
+                    excess = (WATER_QUALITY_STANDARDS['do'] / do_val - 1) * 100 if do_val > 0 else 999
+                    do_str = f"{do_val:.2f} 🔴(-{excess:.1f}%)"
+
+                if nh3n_ok:
+                    nh3n_str = f"{nh3n_val:.2f}"
+                else:
+                    excess = (nh3n_val / WATER_QUALITY_STANDARDS['nh3n'] - 1) * 100
+                    nh3n_str = f"{nh3n_val:.2f} 🔴(+{excess:.1f}%)"
+
+                status_str = "✅ 达标" if all_ok else "❌ 超标"
+
+                table_data.append({
+                    '位置 (m)': f"{xi:.0f}",
+                    'BOD (mg/L)': bod_str,
+                    'DO (mg/L)': do_str,
+                    'NH3-N (mg/L)': nh3n_str,
+                    '达标判定': status_str,
+                })
+
+            df_compliance = pd.DataFrame(table_data)
+
+            def highlight_exceed_cells(val):
+                if '🔴' in str(val):
+                    return 'background-color: #fdecea; color: #c0392b; font-weight: bold'
+                return ''
+
+            styled_df = df_compliance.style.map(highlight_exceed_cells, subset=['BOD (mg/L)', 'DO (mg/L)', 'NH3-N (mg/L)'])
+            styled_df = styled_df.map(
+                lambda v: 'background-color: #fdecea; color: #c0392b' if '❌' in str(v) else 'background-color: #e8f8f5; color: #138d75',
+                subset=['达标判定']
+            )
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+        st.subheader("📊 达标率沿程变化曲线")
+        x_rates, rates = compute_sliding_compliance_rate(result)
+        first_below, first_above = find_threshold_crossings(x_rates, rates)
+        fig_compliance = plot_compliance_curve(x_rates, rates, first_below, first_above)
+        st.pyplot(fig_compliance, use_container_width=True)
+
+        col_cb1, col_cb2, col_cb3 = st.columns(3)
+        with col_cb1:
+            if first_below is not None:
+                st.warning(f"⚠️ 达标率首次跌破60%: **x={first_below[0]:.0f}m** ({first_below[1]:.1f}%)")
+            else:
+                st.success("✅ 达标率全程保持在60%以上")
+        with col_cb2:
+            if first_above is not None:
+                st.success(f"💚 达标率首次回升到80%: **x={first_above[0]:.0f}m** ({first_above[1]:.1f}%)")
+            else:
+                st.info("ℹ️ 达标率尚未回升到80%以上")
+        with col_cb3:
+            avg_rate = np.mean(rates)
+            st.metric("全河段平均达标率", f"{avg_rate:.1f}%")
 
         st.subheader("🌊 水面线图")
         fig_water = plot_water_level_profile(result)
@@ -1016,6 +1347,25 @@ def scenario_analysis_tab():
 
         fig = plot_scenario_comparison(st.session_state.comparison_results, comp_select)
         st.pyplot(fig, use_container_width=True)
+
+        st.subheader("📈 达标率对比曲线")
+        st.caption("基准情景用实线，对比情景用虚线/点线/点划线区分")
+        fig_compare = plot_scenario_compliance_comparison(
+            st.session_state.comparison_results, sc_manager
+        )
+        st.pyplot(fig_compare, use_container_width=True)
+
+        comp_rate_data = []
+        for result in st.session_state.comparison_results:
+            _, rates = compute_sliding_compliance_rate(result)
+            comp_rate_data.append({
+                '情景名称': result['scenario_name'],
+                '全河段平均达标率 (%)': f"{np.mean(rates):.1f}",
+                '最低达标率 (%)': f"{np.min(rates):.1f}",
+                '达标率>80%河段占比 (%)': f"{np.sum(rates >= 80) / len(rates) * 100:.1f}",
+                '达标率<60%河段占比 (%)': f"{np.sum(rates < 60) / len(rates) * 100:.1f}",
+            })
+        st.dataframe(pd.DataFrame(comp_rate_data), use_container_width=True, hide_index=True)
 
         st.subheader("📋 对比统计表")
 
