@@ -28,8 +28,13 @@ from warning_module import (
     run_emergency_simulation,
 )
 
-rcParams['font.sans-serif'] = ['DejaVu Sans']
+rcParams['font.sans-serif'] = [
+    'PingFang SC', 'Heiti SC', 'Microsoft YaHei', 'SimHei',
+    'Arial Unicode MS', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei',
+    'DejaVu Sans'
+]
 rcParams['axes.unicode_minus'] = False
+matplotlib.use('Agg')
 
 st.set_page_config(
     page_title="河流水质动态模拟系统",

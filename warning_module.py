@@ -1,10 +1,20 @@
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.patches import FancyArrowPatch
+from matplotlib import rcParams
+
+rcParams['font.sans-serif'] = [
+    'PingFang SC', 'Heiti SC', 'Microsoft YaHei', 'SimHei',
+    'Arial Unicode MS', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei',
+    'DejaVu Sans'
+]
+rcParams['axes.unicode_minus'] = False
 import io
 import copy
 from datetime import datetime
@@ -319,10 +329,11 @@ def plot_river_warning_schematic(
         y_pos = 0.76
         for name, val, lv, unit, lower_better in info_items:
             lv_color = WARNING_COLORS.get(lv, '#333333')
-            rect = plt.Rectangle((0.05, y_pos - 0.01), 0.90, 0.20,
-                                 facecolor=WARNING_COLORS_LIGHT.get(lv, '#f0f0f0'),
-                                 edgecolor=lv_color, linewidth=1.5,
-                                 boxstyle='round,pad=0.3', transform=ax_info.transAxes)
+            rect = mpatches.FancyBboxPatch((0.05, y_pos - 0.01), 0.90, 0.20,
+                                           boxstyle='round,pad=0.05',
+                                           facecolor=WARNING_COLORS_LIGHT.get(lv, '#f0f0f0'),
+                                           edgecolor=lv_color, linewidth=1.5,
+                                           transform=ax_info.transAxes)
             ax_info.add_patch(rect)
 
             ax_info.text(0.10, y_pos + 0.14, f"{name}",
@@ -549,7 +560,6 @@ def run_emergency_simulation(
             reduce_ratio = measure.params.get('reduce_ratio', 0.5)
             for s in sim_copy.source_manager.sources:
                 if isinstance(s, PointSource) and s.name == source_name:
-                    s.flow_rate *= (1 - reduce_ratio)
                     s.bod_conc *= (1 - reduce_ratio)
                     s.nh3n_conc *= (1 - reduce_ratio)
                     s.cod_conc *= (1 - reduce_ratio)
