@@ -732,14 +732,13 @@ def steady_simulation_tab():
 
         with st.expander("✅ 达标分析", expanded=True):
             st.markdown("**地表水III类标准：** DO ≥ 5mg/L | BOD ≤ 4mg/L | NH3-N ≤ 1mg/L")
+            st.caption(f"共 {len(result['x'])} 个网格点，超标单元格以红色高亮，括号内为超标倍数")
+
             x = result['x']
-            step = max(1, len(x) // 20)
-            sample_indices = list(range(0, len(x), step))
-            if sample_indices[-1] != len(x) - 1:
-                sample_indices.append(len(x) - 1)
+            all_indices = list(range(len(x)))
 
             table_data = []
-            for idx in sample_indices:
+            for idx in all_indices:
                 xi = x[idx]
                 bod_val = result['bod'][idx]
                 do_val = result['do'][idx]
@@ -760,7 +759,7 @@ def steady_simulation_tab():
                     do_str = f"{do_val:.2f}"
                 else:
                     excess = (WATER_QUALITY_STANDARDS['do'] / do_val - 1) * 100 if do_val > 0 else 999
-                    do_str = f"{do_val:.2f} 🔴(-{excess:.1f}%)"
+                    do_str = f"{do_val:.2f} 🔴(+{excess:.1f}%)"
 
                 if nh3n_ok:
                     nh3n_str = f"{nh3n_val:.2f}"
@@ -790,7 +789,7 @@ def steady_simulation_tab():
                 lambda v: 'background-color: #fdecea; color: #c0392b' if '❌' in str(v) else 'background-color: #e8f8f5; color: #138d75',
                 subset=['达标判定']
             )
-            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+            st.dataframe(styled_df, use_container_width=True, hide_index=True, height=420)
 
         st.subheader("📊 达标率沿程变化曲线")
         x_rates, rates = compute_sliding_compliance_rate(result)
